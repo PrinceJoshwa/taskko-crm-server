@@ -2278,10 +2278,33 @@ async def root():
     return {"service": "Tasko CRM", "version": "1.0.0"}
 
 
+def _cors_origins() -> list[str]:
+    raw = os.environ.get("CORS_ORIGINS", "")
+    origins = {
+        "http://localhost:3000",
+        "http://localhost:3001",
+        "http://127.0.0.1:3000",
+        "https://taskko-crm-client.vercel.app",
+    }
+    for item in raw.split(","):
+        origin = item.strip().rstrip("/")
+        if origin and origin != "*":
+            origins.add(origin)
+    for key in ("FRONTEND_URL", "CLIENT_URL", "VERCEL_URL"):
+        origin = os.environ.get(key, "").strip().rstrip("/")
+        if not origin:
+            continue
+        if key == "VERCEL_URL" and not origin.startswith(("http://", "https://")):
+            origin = f"https://{origin}"
+        origins.add(origin)
+    return sorted(origins)
+
+
 app.add_middleware(
     CORSMiddleware,
     allow_credentials=True,
-    allow_origins=os.environ.get("CORS_ORIGINS", "*").split(","),
+    allow_origins=_cors_origins(),
+    allow_origin_regex=os.environ.get("CORS_ALLOW_ORIGIN_REGEX", r"https://.*\.vercel\.app"),
     allow_methods=["*"],
     allow_headers=["*"],
 )
