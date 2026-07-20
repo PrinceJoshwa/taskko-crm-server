@@ -14,6 +14,7 @@ import logging
 import secrets
 import uuid
 import random
+import asyncio
 from datetime import datetime, timezone, timedelta
 from typing import Optional, List, Literal
 
@@ -40,6 +41,18 @@ db = client[DB_NAME]
 
 app = FastAPI(title="Tasko CRM API")
 api = APIRouter(prefix="/api")
+
+import time
+
+@app.middleware("http")
+async def log_request_time(request, call_next):
+    start = time.perf_counter()
+
+    response = await call_next(request)
+
+    print(f"{request.method} {request.url.path} took {time.perf_counter() - start:.2f} seconds")
+
+    return response
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 log = logging.getLogger("tasko")
@@ -417,12 +430,21 @@ async def delete_user(user_id: str, actor: dict = Depends(require_roles("admin")
 @api.get("/projects")
 async def list_projects(user: dict = Depends(get_current_user)):
     docs = await db.projects.find({}, {"_id": 0}).sort("created_at", -1).to_list(500)
-    # attach counts
-    for d in docs:
-        d["units_total"] = await db.units.count_documents({"project_id": d["id"]})
-        d["units_available"] = await db.units.count_documents({"project_id": d["id"], "status": "available"})
-        d["leads_count"] = await db.leads.count_documents({"project_id": d["id"]})
-    return docs
+    
+    async def attach_counts(d):
+        units_total, units_avail, leads_count = await asyncio.gather(
+            db.units.count_documents({"project_id": d["id"]}),
+            db.units.count_documents({"project_id": d["id"], "status": "available"}),
+            db.leads.count_documents({"project_id": d["id"]})
+        )
+        d["units_total"] = units_total
+        d["units_available"] = units_avail
+        d["leads_count"] = leads_count
+        return d
+
+    # Execute all project attachments concurrently
+    docs = await asyncio.gather(*[attach_counts(d) for d in docs])
+    return list(docs)
 
 
 @api.post("/projects")
@@ -499,13 +521,15 @@ async def _pick_auto_assignee() -> Optional[str]:
     execs = await db.users.find({"role": "executive", "active": {"$ne": False}}, {"id": 1, "_id": 0}).to_list(200)
     if not execs:
         return None
-    # pick executive with the fewest open (non-terminal) leads
-    counts = []
-    for e in execs:
-        c = await db.leads.count_documents({"assigned_to": e["id"], "stage": {"$nin": ["booked", "lost"]}})
-        counts.append((c, e["id"]))
-    counts.sort()
-    return counts[0][1]
+    
+    # Run counts concurrently for all executives
+    counts = await asyncio.gather(*[
+        db.leads.count_documents({"assigned_to": e["id"], "stage": {"$nin": ["booked", "lost"]}})
+        for e in execs
+    ])
+    
+    exec_counts = sorted(zip(counts, [e["id"] for e in execs]))
+    return exec_counts[0][1]
 
 
 @api.get("/leads")
@@ -875,34 +899,44 @@ async def analytics_summary(project_id: Optional[str] = None, user: dict = Depen
     if user["role"] == "executive":
         match["assigned_to"] = user["id"]
 
-    total_leads = await db.leads.count_documents(match)
-
-    # stage funnel
-    stages = ["new", "contacted", "qualified", "site_visit", "negotiation", "booked", "lost"]
-    funnel = {}
-    for s in stages:
-        funnel[s] = await db.leads.count_documents({**match, "stage": s})
-
-    # source breakdown
-    pipeline = [{"$match": match}, {"$group": {"_id": "$source", "count": {"$sum": 1}}}]
-    sources = [{"source": r["_id"], "count": r["count"]} async for r in db.leads.aggregate(pipeline)]
-
-    # visits & follow-ups today
     today_start = datetime.combine(now_utc().date(), datetime.min.time()).replace(tzinfo=timezone.utc).isoformat()
     today_end = datetime.combine(now_utc().date(), datetime.max.time()).replace(tzinfo=timezone.utc).isoformat()
-    visits_today = await db.site_visits.count_documents({"scheduled_at": {"$gte": today_start, "$lte": today_end}})
-    followups_pending = await db.follow_ups.count_documents({"status": "pending"})
+    stages = ["new", "contacted", "qualified", "site_visit", "negotiation", "booked", "lost"]
 
-    # last 7d trend
-    trend = []
-    for i in range(6, -1, -1):
-        d = (now_utc() - timedelta(days=i)).date()
-        start = datetime.combine(d, datetime.min.time()).replace(tzinfo=timezone.utc).isoformat()
-        end = datetime.combine(d, datetime.max.time()).replace(tzinfo=timezone.utc).isoformat()
-        cnt = await db.leads.count_documents({**match, "created_at": {"$gte": start, "$lte": end}})
-        trend.append({"date": d.isoformat(), "leads": cnt})
+    async def get_trend():
+        trend_data = []
+        tasks = []
+        for i in range(6, -1, -1):
+            d = (now_utc() - timedelta(days=i)).date()
+            start = datetime.combine(d, datetime.min.time()).replace(tzinfo=timezone.utc).isoformat()
+            end = datetime.combine(d, datetime.max.time()).replace(tzinfo=timezone.utc).isoformat()
+            trend_data.append({"date": d.isoformat()})
+            tasks.append(db.leads.count_documents({**match, "created_at": {"$gte": start, "$lte": end}}))
+        
+        results = await asyncio.gather(*tasks)
+        for i, row in enumerate(trend_data):
+            row["leads"] = results[i]
+        return trend_data
+        
+    async def get_sources():
+        pipeline = [{"$match": match}, {"$group": {"_id": "$source", "count": {"$sum": 1}}}]
+        return [{"source": r["_id"], "count": r["count"]} async for r in db.leads.aggregate(pipeline)]
 
-    # conversion
+    stage_tasks = [db.leads.count_documents({**match, "stage": s}) for s in stages]
+    
+    # Execute everything concurrently
+    (
+        total_leads, visits_today, followups_pending, trend, sources, *stage_results
+    ) = await asyncio.gather(
+        db.leads.count_documents(match),
+        db.site_visits.count_documents({"scheduled_at": {"$gte": today_start, "$lte": today_end}}),
+        db.follow_ups.count_documents({"status": "pending"}),
+        get_trend(),
+        get_sources(),
+        *stage_tasks
+    )
+    
+    funnel = {s: count for s, count in zip(stages, stage_results)}
     booked = funnel.get("booked", 0)
     conversion = round((booked / total_leads * 100), 1) if total_leads else 0.0
 
@@ -1245,7 +1279,7 @@ def _month_bounds(dt: datetime) -> tuple:
 
 @api.get("/dashboard/monthly")
 async def dashboard_monthly(user: dict = Depends(get_current_user)):
-    """Month's Updates tab data."""
+    """Month's Updates tab data. Now fully parallelized."""
     scope: dict = {}
     if user["role"] == "executive":
         scope["assigned_to"] = user["id"]
@@ -1255,69 +1289,81 @@ async def dashboard_monthly(user: dict = Depends(get_current_user)):
     prev_dt = cur_start - timedelta(days=1)
     prev_start, prev_end = _month_bounds(prev_dt)
 
-    def iso(d):
-        return d.isoformat()
+    def iso(d): return d.isoformat()
 
-    # KPIs current month
-    new_leads = await db.leads.count_documents({**scope, "created_at": {"$gte": iso(cur_start), "$lt": iso(cur_end)}})
-    booked = await db.leads.count_documents({**scope, "stage": "booked", "updated_at": {"$gte": iso(cur_start), "$lt": iso(cur_end)}})
-    # revenue = sum of accepted proposals in month
-    cur_rev_pipe = [
-        {"$match": {"status": "accepted", "created_at": {"$gte": iso(cur_start), "$lt": iso(cur_end)}}},
-        {"$group": {"_id": None, "total": {"$sum": "$amount"}}},
-    ]
-    cur_rev_docs = [r async for r in db.proposals.aggregate(cur_rev_pipe)]
-    cur_revenue = cur_rev_docs[0]["total"] if cur_rev_docs else 0
+    async def get_cur_revenue():
+        cur_rev_pipe = [
+            {"$match": {"status": "accepted", "created_at": {"$gte": iso(cur_start), "$lt": iso(cur_end)}}},
+            {"$group": {"_id": None, "total": {"$sum": "$amount"}}},
+        ]
+        docs = [r async for r in db.proposals.aggregate(cur_rev_pipe)]
+        return docs[0]["total"] if docs else 0
 
-    prev_rev_pipe = [
-        {"$match": {"status": "accepted", "created_at": {"$gte": iso(prev_start), "$lt": iso(prev_end)}}},
-        {"$group": {"_id": None, "total": {"$sum": "$amount"}}},
-    ]
-    prev_rev_docs = [r async for r in db.proposals.aggregate(prev_rev_pipe)]
-    prev_revenue = prev_rev_docs[0]["total"] if prev_rev_docs else 0
+    async def get_prev_revenue():
+        prev_rev_pipe = [
+            {"$match": {"status": "accepted", "created_at": {"$gte": iso(prev_start), "$lt": iso(prev_end)}}},
+            {"$group": {"_id": None, "total": {"$sum": "$amount"}}},
+        ]
+        docs = [r async for r in db.proposals.aggregate(prev_rev_pipe)]
+        return docs[0]["total"] if docs else 0
 
-    total_leads_m = new_leads
-    conversion = round((booked / total_leads_m) * 100, 2) if total_leads_m > 0 else 0.0
+    async def get_telemetry():
+        telemetry_data = []
+        tasks = []
+        for i in range(3, -1, -1):
+            month_dt = (cur_start.replace(day=15) - timedelta(days=30 * i))
+            ms, me = _month_bounds(month_dt)
+            telemetry_data.append({"label": ms.strftime("%b-%y"), "month": ms.strftime("%Y-%m")})
+            for kind_key, kinds in (
+                ("outgoing_call", ["outgoing_call", "call"]),
+                ("email_sent", ["email_sent", "email"]),
+                ("sms_sent", ["sms_sent"]),
+                ("followup_scheduled", ["followup_scheduled"]),
+            ):
+                tasks.append(db.activities.count_documents({
+                    "kind": {"$in": kinds},
+                    "created_at": {"$gte": iso(ms), "$lt": iso(me)},
+                }))
+        
+        results = await asyncio.gather(*tasks)
+        idx = 0
+        for row in telemetry_data:
+            row["outgoing_call"] = results[idx]; idx += 1
+            row["email_sent"] = results[idx]; idx += 1
+            row["sms_sent"] = results[idx]; idx += 1
+            row["followup_scheduled"] = results[idx]; idx += 1
+        return telemetry_data
 
-    revenue_pct = 0
-    if prev_revenue > 0:
-        revenue_pct = round(((cur_revenue - prev_revenue) / prev_revenue) * 100, 2)
+    async def get_pipeline():
+        stages = ["new", "contacted", "qualified", "site_visit", "negotiation", "booked", "lost"]
+        tasks = [db.leads.count_documents({**scope, "stage": s}) for s in stages]
+        results = await asyncio.gather(*tasks)
+        return [{"stage": s, "count": count} for s, count in zip(stages, results)]
 
-    # Telemetry — last 4 months by activity kind
-    telemetry = []
-    for i in range(3, -1, -1):
-        month_dt = (cur_start.replace(day=15) - timedelta(days=30 * i))
-        ms, me = _month_bounds(month_dt)
-        row = {"label": ms.strftime("%b-%y"), "month": ms.strftime("%Y-%m")}
-        for kind_key, kinds in (
-            ("outgoing_call", ["outgoing_call", "call"]),
-            ("email_sent", ["email_sent", "email"]),
-            ("sms_sent", ["sms_sent"]),
-            ("followup_scheduled", ["followup_scheduled"]),
-        ):
-            row[kind_key] = await db.activities.count_documents({
-                "kind": {"$in": kinds},
-                "created_at": {"$gte": iso(ms), "$lt": iso(me)},
-            })
-        telemetry.append(row)
+    async def get_top_leads():
+        top = await db.leads.find({**scope, "stars": {"$gt": 0}}, {"_id": 0}).sort([("stars", -1), ("updated_at", -1)]).limit(6).to_list(6)
+        if len(top) < 6:
+            rest = await db.leads.find({**scope, "stage": {"$nin": ["lost", "booked"]}}, {"_id": 0}).sort("updated_at", -1).limit(6 - len(top)).to_list(6)
+            top = top + [r for r in rest if r["id"] not in {t["id"] for t in top}]
+        return top
 
-    # Total lead pipeline (bar) — counts by stage across all-time in scope
-    stages = ["new", "contacted", "qualified", "site_visit", "negotiation", "booked", "lost"]
-    pipeline = []
-    for s in stages:
-        pipeline.append({"stage": s, "count": await db.leads.count_documents({**scope, "stage": s})})
+    # Fire all 30+ DB queries concurrently instead of sequentially
+    (
+        new_leads, booked, cur_revenue, prev_revenue, telemetry, pipeline, closures_raw, top, recent
+    ) = await asyncio.gather(
+        db.leads.count_documents({**scope, "created_at": {"$gte": iso(cur_start), "$lt": iso(cur_end)}}),
+        db.leads.count_documents({**scope, "stage": "booked", "updated_at": {"$gte": iso(cur_start), "$lt": iso(cur_end)}}),
+        get_cur_revenue(),
+        get_prev_revenue(),
+        get_telemetry(),
+        get_pipeline(),
+        db.leads.find({**scope, "stage": {"$in": ["negotiation", "site_visit"]}}, {"_id": 0}).sort("updated_at", -1).limit(8).to_list(8),
+        get_top_leads(),
+        db.leads.find(scope, {"_id": 0}).sort("created_at", -1).limit(8).to_list(8)
+    )
 
-    # Upcoming closures — proposals in draft/sent with validity ending soon OR leads in negotiation
-    closures_raw = await db.leads.find({**scope, "stage": {"$in": ["negotiation", "site_visit"]}}, {"_id": 0}).sort("updated_at", -1).limit(8).to_list(8)
-
-    # Top leads — sorted by stars desc then updated_at
-    top = await db.leads.find({**scope, "stars": {"$gt": 0}}, {"_id": 0}).sort([("stars", -1), ("updated_at", -1)]).limit(6).to_list(6)
-    if len(top) < 6:
-        rest = await db.leads.find({**scope, "stage": {"$nin": ["lost", "booked"]}}, {"_id": 0}).sort("updated_at", -1).limit(6 - len(top)).to_list(6)
-        top = top + [r for r in rest if r["id"] not in {t["id"] for t in top}]
-
-    # Recent inquiries — latest 8 leads
-    recent = await db.leads.find(scope, {"_id": 0}).sort("created_at", -1).limit(8).to_list(8)
+    conversion = round((booked / new_leads) * 100, 2) if new_leads > 0 else 0.0
+    revenue_pct = round(((cur_revenue - prev_revenue) / prev_revenue) * 100, 2) if prev_revenue > 0 else 0
 
     return {
         "period": {"start": iso(cur_start), "end": iso(cur_end)},
@@ -1340,48 +1386,35 @@ async def dashboard_action_items(user: dict = Depends(get_current_user)):
     now = now_utc()
     day_start = datetime(now.year, now.month, now.day, tzinfo=timezone.utc)
     day_end = day_start + timedelta(days=1)
+    def iso(d): return d.isoformat()
 
-    def iso(d):
-        return d.isoformat()
+    # Parallelize phase 1
+    (missed, todays_followups, scheduled_calls, tasks, planned_visits, lead_docs) = await asyncio.gather(
+        db.activities.count_documents({"kind": "missed_call", "created_at": {"$gte": iso(day_start), "$lt": iso(day_end)}}),
+        db.follow_ups.find({**scope, "status": "pending", "due_at": {"$gte": iso(day_start), "$lt": iso(day_end)}}, {"_id": 0}).sort("due_at", 1).to_list(100),
+        db.follow_ups.count_documents({**scope, "status": "pending", "kind": "call"}),
+        db.follow_ups.count_documents({**scope, "status": "pending", "kind": {"$in": ["meeting", "email", "whatsapp"]}}),
+        db.site_visits.find({**scope, "status": "scheduled", "scheduled_at": {"$gte": iso(day_start - timedelta(days=1)), "$lt": iso(day_start + timedelta(days=7))}}, {"_id": 0}).sort("scheduled_at", 1).to_list(100),
+        db.leads.find({**scope, "stage": {"$nin": ["booked", "lost"]}}, {"_id": 0}).sort("created_at", -1).limit(200).to_list(200)
+    )
 
-    # Missed calls today (activity kind = missed_call)
-    missed = await db.activities.count_documents({
-        "kind": "missed_call",
-        "created_at": {"$gte": iso(day_start), "$lt": iso(day_end)},
-    })
-
-    todays_followups = await db.follow_ups.find({
-        **scope,
-        "status": "pending",
-        "due_at": {"$gte": iso(day_start), "$lt": iso(day_end)},
-    }, {"_id": 0}).sort("due_at", 1).to_list(100)
-
-    scheduled_calls = await db.follow_ups.count_documents({**scope, "status": "pending", "kind": "call"})
-    tasks = await db.follow_ups.count_documents({**scope, "status": "pending", "kind": {"$in": ["meeting", "email", "whatsapp"]}})
-
-    planned_visits = await db.site_visits.find({
-        **scope,
-        "status": "scheduled",
-        "scheduled_at": {"$gte": iso(day_start - timedelta(days=1)), "$lt": iso(day_start + timedelta(days=7))},
-    }, {"_id": 0}).sort("scheduled_at", 1).to_list(100)
-
-    # Leads with no calls done — leads with no activities of call kind
-    lead_docs = await db.leads.find({**scope, "stage": {"$nin": ["booked", "lost"]}}, {"_id": 0}).sort("created_at", -1).limit(200).to_list(200)
     lead_ids = [l["id"] for l in lead_docs]
     called_ids = set()
-    if lead_ids:
-        pipe = [
-            {"$match": {"lead_id": {"$in": lead_ids}, "kind": {"$in": ["outgoing_call", "call", "incoming_call", "missed_call"]}}},
-            {"$group": {"_id": "$lead_id"}},
-        ]
-        called_ids = {r["_id"] async for r in db.activities.aggregate(pipe)}
-    no_call_leads = [l for l in lead_docs if l["id"] not in called_ids][:12]
-
-    # No follow-up added leads
     followed_ids = set()
+
     if lead_ids:
-        followed = await db.follow_ups.find({"lead_id": {"$in": lead_ids}}, {"lead_id": 1}).to_list(len(lead_ids))
-        followed_ids = {f["lead_id"] for f in followed}
+        # Parallelize phase 2
+        async def get_called():
+            pipe = [{"$match": {"lead_id": {"$in": lead_ids}, "kind": {"$in": ["outgoing_call", "call", "incoming_call", "missed_call"]}}}, {"$group": {"_id": "$lead_id"}}]
+            return {r["_id"] async for r in db.activities.aggregate(pipe)}
+
+        async def get_followed():
+            followed = await db.follow_ups.find({"lead_id": {"$in": lead_ids}}, {"lead_id": 1}).to_list(len(lead_ids))
+            return {f["lead_id"] for f in followed}
+
+        called_ids, followed_ids = await asyncio.gather(get_called(), get_followed())
+
+    no_call_leads = [l for l in lead_docs if l["id"] not in called_ids][:12]
     no_followup_leads = [l for l in lead_docs if l["id"] not in followed_ids][:12]
 
     return {
@@ -2591,36 +2624,44 @@ _scheduler: Optional[AsyncIOScheduler] = None
 async def on_startup():
     global _scheduler
     try:
-        await db.users.create_index("email", unique=True)
-        await db.leads.create_index("stage")
-        await db.leads.create_index("assigned_to")
-        await db.leads.create_index("project_id")
-        await db.units.create_index([("project_id", 1), ("tower", 1), ("floor", 1)])
-        await db.site_visits.create_index("scheduled_at")
-        await db.follow_ups.create_index("due_at")
-        await db.activities.create_index("lead_id")
-        await db.activities.create_index("kind")
-        await db.activities.create_index("created_at")
-        await db.proposals.create_index("lead_id")
-        await db.whatsapp_templates.create_index("name")
-        await db.notifications.create_index([("user_id", 1), ("created_at", -1)])
-        await db.notifications.create_index([("role_scope", 1), ("created_at", -1)])
-        await db.notifications.create_index("dedupe_key")
+        # Run index creation concurrently to save startup time
+        await asyncio.gather(
+            db.users.create_index("email", unique=True),
+            db.leads.create_index("stage"),
+            db.leads.create_index("assigned_to"),
+            db.leads.create_index("project_id"),
+            db.units.create_index([("project_id", 1), ("tower", 1), ("floor", 1)]),
+            db.site_visits.create_index("scheduled_at"),
+            db.follow_ups.create_index("due_at"),
+            db.activities.create_index("lead_id"),
+            db.activities.create_index("kind"),
+            db.activities.create_index("created_at"),
+            db.proposals.create_index("lead_id"),
+            db.whatsapp_templates.create_index("name"),
+            db.notifications.create_index([("user_id", 1), ("created_at", -1)]),
+            db.notifications.create_index([("role_scope", 1), ("created_at", -1)]),
+            db.notifications.create_index("dedupe_key"),
+            return_exceptions=True
+        )
     except Exception as e:
         log.warning(f"index setup: {e}")
-    await seed_demo()
 
-    # Scheduler: EOD email at IST 18:00; notif refresh every 15 minutes
-    try:
-        eod_hour = int(os.environ.get("EOD_HOUR_IST", "18"))
-        eod_min = int(os.environ.get("EOD_MIN_IST", "0"))
-        _scheduler = AsyncIOScheduler(timezone=IST)
-        _scheduler.add_job(send_eod_email_to_admins, CronTrigger(hour=eod_hour, minute=eod_min), id="eod-email", replace_existing=True)
-        _scheduler.add_job(refresh_notifications, "interval", minutes=15, id="notif-refresh", replace_existing=True, next_run_time=now_utc() + timedelta(seconds=30))
-        _scheduler.start()
-        log.info("Scheduler started (EOD %02d:%02d IST, notif-refresh every 15m)", eod_hour, eod_min)
-    except Exception as e:
-        log.warning("Scheduler setup failed: %s", e)
+    # Vercel injects the VERCEL env var automatically.
+    # We skip seeding and schedulers on Vercel to prevent cold-start timeouts.
+    if not os.environ.get("VERCEL"):
+        await seed_demo()
+
+        # Scheduler: EOD email at IST 18:00; notif refresh every 15 minutes
+        try:
+            eod_hour = int(os.environ.get("EOD_HOUR_IST", "18"))
+            eod_min = int(os.environ.get("EOD_MIN_IST", "0"))
+            _scheduler = AsyncIOScheduler(timezone=IST)
+            _scheduler.add_job(send_eod_email_to_admins, CronTrigger(hour=eod_hour, minute=eod_min), id="eod-email", replace_existing=True)
+            _scheduler.add_job(refresh_notifications, "interval", minutes=15, id="notif-refresh", replace_existing=True, next_run_time=now_utc() + timedelta(seconds=30))
+            _scheduler.start()
+            log.info("Scheduler started (EOD %02d:%02d IST, notif-refresh every 15m)", eod_hour, eod_min)
+        except Exception as e:
+            log.warning("Scheduler setup failed: %s", e)
 
     log.info("Tasko CRM startup complete.")
 
