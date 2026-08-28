@@ -2692,6 +2692,9 @@ import secrets
 import uuid
 import random
 import asyncio
+import json
+import urllib.parse
+import urllib.request
 from datetime import datetime, timezone, timedelta
 from typing import Optional, List, Literal
 
@@ -2807,8 +2810,10 @@ def require_roles(*roles: str):
 def set_auth_cookies(resp: Response, user_id: str, email: str, role: str) -> None:
     access = create_token(user_id, email, role, "access", ttl_min=60 * 12)
     refresh = create_token(user_id, email, role, "refresh", ttl_min=60 * 24 * 7)
-    resp.set_cookie("access_token", access, httponly=True, secure=True, samesite="none", max_age=60 * 60 * 12, path="/")
-    resp.set_cookie("refresh_token", refresh, httponly=True, secure=True, samesite="none", max_age=60 * 60 * 24 * 7, path="/")
+    secure_cookie = os.environ.get("BACKEND_PUBLIC_URL", "").startswith("https://")
+    same_site = "none" if secure_cookie else "lax"
+    resp.set_cookie("access_token", access, httponly=True, secure=secure_cookie, samesite=same_site, max_age=60 * 60 * 12, path="/")
+    resp.set_cookie("refresh_token", refresh, httponly=True, secure=secure_cookie, samesite=same_site, max_age=60 * 60 * 24 * 7, path="/")
 
 
 def clean(doc: dict) -> dict:
@@ -2819,12 +2824,86 @@ def clean(doc: dict) -> dict:
     return doc
 
 
+def mask_phone(value: Optional[str]) -> Optional[str]:
+    if not value:
+        return value
+    digits = "".join(ch for ch in str(value) if ch.isdigit())
+    if len(digits) <= 4:
+        return "••••"
+    return f"{'•' * max(len(digits) - 4, 4)}{digits[-4:]}"
+
+
+PHONE_FIELDS = ("phone", "secondary_contact_phone")
+
+
+def sanitize_phone_fields(doc: dict, user: dict) -> dict:
+    if not doc or user.get("role") == "admin":
+        return doc
+    sanitized = dict(doc)
+    for field in PHONE_FIELDS:
+        if sanitized.get(field):
+            sanitized[field] = mask_phone(sanitized[field])
+            sanitized[f"{field}_masked"] = True
+    return sanitized
+
+
+def sanitize_many(docs: list[dict], user: dict) -> list[dict]:
+    return [sanitize_phone_fields(d, user) for d in docs]
+
+
+def sanitize_contact_doc(doc: dict, user: dict) -> dict:
+    if not doc:
+        return doc
+    clean(doc)
+    if user.get("role") == "admin":
+        return doc
+    sanitized = dict(doc)
+    if sanitized.get("phone"):
+        sanitized["phone"] = mask_phone(sanitized["phone"])
+        sanitized["phone_masked"] = True
+    return sanitized
+
+
+def owner_ids_for_visit(visit: dict) -> list[str]:
+    ids = [
+        visit.get("presales_owner_id"),
+        visit.get("sales_owner_id"),
+        visit.get("assigned_to"),
+    ]
+    return list(dict.fromkeys([i for i in ids if i]))
+
+
+async def can_access_lead(lead: dict, user: dict) -> bool:
+    if user.get("role") in {"admin", "manager"}:
+        return True
+    if lead.get("assigned_to") == user.get("id"):
+        return True
+    visit = await db.site_visits.find_one({
+        "lead_id": lead.get("id"),
+        "$or": [
+            {"presales_owner_id": user.get("id")},
+            {"sales_owner_id": user.get("id")},
+            {"assigned_to": user.get("id")},
+        ],
+    })
+    return bool(visit)
+
+
+async def require_lead_access(lead_id: str, user: dict) -> dict:
+    lead = await db.leads.find_one({"id": lead_id}, {"_id": 0})
+    if not lead:
+        raise HTTPException(status_code=404, detail="Lead not found")
+    if not await can_access_lead(lead, user):
+        raise HTTPException(status_code=403, detail="Not your lead")
+    return lead
+
+
 # ---------------------------------------------------------------------------
 # Models (pydantic schemas for requests / responses)
 # ---------------------------------------------------------------------------
-Role = Literal["admin", "manager", "executive"]
+Role = Literal["admin", "manager", "executive", "sales"]
 LeadStage = Literal["new", "contacted", "qualified", "site_visit", "negotiation", "booked", "lost"]
-LeadSource = Literal["magicbricks", "99acres", "commonfloor", "housing", "website", "google_ads", "facebook", "instagram", "referral", "walk_in", "manual"]
+LeadSource = Literal["magicbricks", "99acres", "commonfloor", "housing", "website", "jagathi_website", "google_ads", "facebook", "instagram", "referral", "walk_in", "manual"]
 UnitStatus = Literal["available", "held", "booked", "sold"]
 VisitStatus = Literal["scheduled", "completed", "no_show", "cancelled"]
 FollowUpStatus = Literal["pending", "done", "missed"]
@@ -2884,6 +2963,9 @@ class LeadBody(BaseDoc):
     name: str
     phone: Optional[str] = None
     email: Optional[EmailStr] = None
+    secondary_contact_name: Optional[str] = None
+    secondary_contact_email: Optional[EmailStr] = None
+    secondary_contact_phone: Optional[str] = None
     source: LeadSource = "manual"
     project_id: Optional[str] = None
     budget_min: Optional[float] = None
@@ -2900,6 +2982,9 @@ class UpdateLeadBody(BaseDoc):
     name: Optional[str] = None
     phone: Optional[str] = None
     email: Optional[EmailStr] = None
+    secondary_contact_name: Optional[str] = None
+    secondary_contact_email: Optional[EmailStr] = None
+    secondary_contact_phone: Optional[str] = None
     source: Optional[LeadSource] = None
     project_id: Optional[str] = None
     budget_min: Optional[float] = None
@@ -2932,6 +3017,8 @@ class SiteVisitBody(BaseDoc):
     lead_id: str
     project_id: str
     scheduled_at: datetime
+    presales_owner_id: Optional[str] = None
+    sales_owner_id: Optional[str] = None
     assigned_to: Optional[str] = None
     notes: Optional[str] = None
 
@@ -2941,6 +3028,8 @@ class UpdateSiteVisitBody(BaseDoc):
     status: Optional[VisitStatus] = None
     notes: Optional[str] = None
     outcome: Optional[str] = None
+    presales_owner_id: Optional[str] = None
+    sales_owner_id: Optional[str] = None
     assigned_to: Optional[str] = None
 
 
@@ -2969,6 +3058,14 @@ class SettingsBody(BaseDoc):
     auto_call_on_new_lead: Optional[bool] = None
     missed_call_followup_enabled: Optional[bool] = None
     missed_call_followup_hours: Optional[float] = None
+    calling_provider: Optional[str] = None
+    sms_provider: Optional[str] = None
+    google_calendar_credentials_json: Optional[str] = None
+    google_calendar_id: Optional[str] = None
+    whatsapp_provider: Optional[str] = None
+    whatsapp_service_url: Optional[str] = None
+    whatsapp_access_token: Optional[str] = None
+    whatsapp_instance_id: Optional[str] = None
 
 
 # ---------------------------------------------------------------------------
@@ -3012,7 +3109,7 @@ async def logout(response: Response):
 
 @api.get("/auth/me")
 async def me(user: dict = Depends(get_current_user)):
-    return user
+    return sanitize_contact_doc(user, user)
 
 
 @api.post("/auth/refresh")
@@ -3030,7 +3127,7 @@ async def refresh(request: Request, response: Response):
     if not user:
         raise HTTPException(status_code=401, detail="User not found")
     set_auth_cookies(response, user["id"], user["email"], user["role"])
-    return clean(user)
+    return sanitize_contact_doc(clean(user), user)
 
 
 # ---------------------------------------------------------------------------
@@ -3039,7 +3136,7 @@ async def refresh(request: Request, response: Response):
 @api.get("/users")
 async def list_users(user: dict = Depends(get_current_user)):
     docs = await db.users.find({}, {"password_hash": 0, "_id": 0}).sort("created_at", -1).to_list(500)
-    return docs
+    return [sanitize_contact_doc(d, user) for d in docs]
 
 
 @api.post("/users")
@@ -3053,11 +3150,12 @@ async def create_user(body: RegisterBody, actor: dict = Depends(require_roles("a
         "name": body.name,
         "role": body.role,
         "password_hash": hash_password(body.password),
+        "phone": body.phone or "",
         "active": True,
         "created_at": now_utc().isoformat(),
     }
     await db.users.insert_one(doc)
-    return clean(doc)
+    return sanitize_contact_doc(clean(doc), actor)
 
 
 class UpdateSelfBody(BaseDoc):
@@ -3074,7 +3172,7 @@ async def update_self(body: UpdateSelfBody, actor: dict = Depends(get_current_us
     if not update:
         raise HTTPException(status_code=400, detail="Nothing to update")
     await db.users.update_one({"id": actor["id"]}, {"$set": update})
-    return await db.users.find_one({"id": actor["id"]}, {"password_hash": 0, "_id": 0})
+    return sanitize_contact_doc(await db.users.find_one({"id": actor["id"]}, {"password_hash": 0, "_id": 0}), actor)
 
 
 @api.patch("/users/{user_id}")
@@ -3234,24 +3332,20 @@ async def list_leads(
             {"email": {"$regex": search, "$options": "i"}},
         ]
     # executives only see their leads
-    if user["role"] == "executive":
+    if user["role"] in {"executive", "sales"}:
         q["assigned_to"] = user["id"]
     docs = await db.leads.find(q, {"_id": 0}).sort("created_at", -1).to_list(2000)
-    return docs
+    return sanitize_many(docs, user)
 
 
 @api.get("/leads/{lead_id}")
 async def get_lead(lead_id: str, user: dict = Depends(get_current_user)):
-    doc = await db.leads.find_one({"id": lead_id}, {"_id": 0})
-    if not doc:
-        raise HTTPException(status_code=404, detail="Lead not found")
-    if user["role"] == "executive" and doc.get("assigned_to") != user["id"]:
-        raise HTTPException(status_code=403, detail="Not your lead")
-    return doc
+    doc = await require_lead_access(lead_id, user)
+    return sanitize_phone_fields(doc, user)
 
 
 @api.post("/leads")
-async def create_lead(body: LeadBody, actor: dict = Depends(get_current_user)):
+async def create_lead(body: LeadBody, actor: dict = Depends(require_roles("admin"))):
     doc = body.model_dump()
     doc["id"] = new_id()
     doc["created_at"] = now_utc().isoformat()
@@ -3280,22 +3374,19 @@ async def create_lead(body: LeadBody, actor: dict = Depends(get_current_user)):
         assignee = await db.users.find_one({"id": doc["assigned_to"]})
         if assignee and assignee.get("phone"):
             try:
-                await _initiate_twilio_call(doc, assignee)
+                await _initiate_call(doc, assignee)
             except HTTPException as e:
                 log.warning("auto-call skipped: %s", e.detail)
             except Exception as e:
                 log.warning("auto-call error: %s", e)
-    return doc
+    return sanitize_phone_fields(doc, actor)
 
 
 @api.patch("/leads/{lead_id}")
-async def update_lead(lead_id: str, body: UpdateLeadBody, actor: dict = Depends(get_current_user)):
+async def update_lead(lead_id: str, body: UpdateLeadBody, actor: dict = Depends(require_roles("admin"))):
     lead = await db.leads.find_one({"id": lead_id})
     if not lead:
         raise HTTPException(status_code=404, detail="Lead not found")
-    # Executives can only edit their own leads. Admin/manager can edit any.
-    if actor["role"] == "executive" and lead.get("assigned_to") != actor["id"]:
-        raise HTTPException(status_code=403, detail="You can only edit your own leads")
     update = body.model_dump(exclude_none=True)
     if not update:
         raise HTTPException(status_code=400, detail="Nothing to update")
@@ -3307,11 +3398,11 @@ async def update_lead(lead_id: str, body: UpdateLeadBody, actor: dict = Depends(
         await log_activity(lead_id, actor, "stage_change", f"Stage moved to {update['stage']}")
     if "assigned_to" in update:
         await log_activity(lead_id, actor, "assignment", f"Assigned to user {update['assigned_to']}")
-    return await db.leads.find_one({"id": lead_id}, {"_id": 0})
+    return sanitize_phone_fields(await db.leads.find_one({"id": lead_id}, {"_id": 0}), actor)
 
 
 @api.post("/leads/{lead_id}/assign")
-async def assign_lead(lead_id: str, body: AssignBody, actor: dict = Depends(require_roles("admin", "manager"))):
+async def assign_lead(lead_id: str, body: AssignBody, actor: dict = Depends(require_roles("admin"))):
     r = await db.leads.update_one(
         {"id": lead_id},
         {"$set": {"assigned_to": body.user_id, "updated_at": now_utc().isoformat()}},
@@ -3330,21 +3421,22 @@ async def assign_lead(lead_id: str, body: AssignBody, actor: dict = Depends(requ
             link=f"/leads/{lead_id}",
             meta={"lead_id": lead_id},
         )
-    return lead
+    return sanitize_phone_fields(lead, actor)
 
 
 @api.post("/leads/{lead_id}/stage")
-async def move_stage(lead_id: str, body: StageBody, actor: dict = Depends(get_current_user)):
+async def move_stage(lead_id: str, body: StageBody, actor: dict = Depends(require_roles("admin"))):
     update = {"stage": body.stage, "updated_at": now_utc().isoformat()}
     r = await db.leads.update_one({"id": lead_id}, {"$set": update})
     if r.matched_count == 0:
         raise HTTPException(status_code=404, detail="Lead not found")
     await log_activity(lead_id, actor, "stage_change", f"Stage → {body.stage}" + (f": {body.note}" if body.note else ""))
-    return await db.leads.find_one({"id": lead_id}, {"_id": 0})
+    return sanitize_phone_fields(await db.leads.find_one({"id": lead_id}, {"_id": 0}), actor)
 
 
 @api.post("/leads/{lead_id}/notes")
 async def add_note(lead_id: str, body: NoteBody, actor: dict = Depends(get_current_user)):
+    await require_lead_access(lead_id, actor)
     await log_activity(lead_id, actor, body.kind, body.text)
     return {"ok": True}
 
@@ -3366,6 +3458,7 @@ async def _ingest_lead_from_payload(source: str, payload: dict) -> dict:
     name = payload.get("name") or payload.get("full_name") or payload.get("customer_name") or "Unknown"
     phone = payload.get("phone") or payload.get("mobile") or payload.get("contact")
     email = payload.get("email") or payload.get("customer_email")
+    secondary_phone = payload.get("secondary_contact_phone") or payload.get("alternate_phone") or payload.get("alt_phone")
     project_name = payload.get("project") or payload.get("project_name")
     project = None
     if project_name:
@@ -3375,6 +3468,9 @@ async def _ingest_lead_from_payload(source: str, payload: dict) -> dict:
         "name": name,
         "phone": phone,
         "email": email,
+        "secondary_contact_name": payload.get("secondary_contact_name") or payload.get("alternate_contact_name"),
+        "secondary_contact_email": payload.get("secondary_contact_email") or payload.get("alternate_email"),
+        "secondary_contact_phone": secondary_phone,
         "source": source,
         "project_id": project["id"] if project else None,
         "budget_min": payload.get("budget_min"),
@@ -3408,7 +3504,7 @@ async def _ingest_lead_from_payload(source: str, payload: dict) -> dict:
         assignee = await db.users.find_one({"id": lead["assigned_to"]})
         if assignee and assignee.get("phone"):
             try:
-                await _initiate_twilio_call(lead, assignee)
+                await _initiate_call(lead, assignee)
             except Exception as e:
                 log.warning("auto-call (webhook) skipped: %s", e)
     return lead
@@ -3421,11 +3517,37 @@ async def webhook_leads(source: str, payload: dict):
     Accepts sources: magicbricks, 99acres, commonfloor, housing, website,
     google_ads, facebook, instagram, referral, walk_in.
     """
-    allowed = {"magicbricks", "99acres", "commonfloor", "housing", "website", "google_ads", "facebook", "instagram", "referral", "walk_in"}
+    allowed = {"magicbricks", "99acres", "commonfloor", "housing", "website", "jagathi_website", "google_ads", "facebook", "instagram", "referral", "walk_in"}
     if source not in allowed:
         raise HTTPException(status_code=400, detail=f"Unknown source '{source}'")
     lead = await _ingest_lead_from_payload(source, payload)
     return {"ok": True, "lead_id": lead["id"]}
+
+
+@api.post("/integrations/jagathi/channel-partner")
+async def jagathi_channel_partner_webhook(payload: dict):
+    lead = await _ingest_lead_from_payload("jagathi_website", payload)
+    await log_activity(lead["id"], None, "channel_partner_lead", "Captured from Jagathi channel partner form", {"raw": payload})
+    return {"ok": True, "lead_id": lead["id"]}
+
+
+async def sync_site_visit_calendar_event(visit: dict, action: str = "upsert") -> dict:
+    settings = await db.settings.find_one({"id": "singleton"}) or {}
+    if not settings.get("google_calendar_enabled"):
+        return {"status": "disabled"}
+    if not settings.get("google_calendar_credentials_json") or not settings.get("google_calendar_id"):
+        return {"status": "pending_credentials", "message": "Google Calendar credentials are not configured"}
+    await db.activities.insert_one({
+        "id": new_id(),
+        "lead_id": visit.get("lead_id"),
+        "actor_id": None,
+        "actor_name": "system",
+        "kind": "calendar_sync_pending",
+        "message": f"Google Calendar {action} prepared for site visit",
+        "meta": {"visit_id": visit.get("id"), "calendar_id": settings.get("google_calendar_id")},
+        "created_at": now_utc().isoformat(),
+    })
+    return {"status": "prepared"}
 
 
 # ---------------------------------------------------------------------------
@@ -3438,8 +3560,8 @@ async def list_visits(project_id: Optional[str] = None, lead_id: Optional[str] =
         q["project_id"] = project_id
     if lead_id:
         q["lead_id"] = lead_id
-    if user["role"] == "executive":
-        q["assigned_to"] = user["id"]
+    if user["role"] in {"executive", "sales"}:
+        q["$or"] = [{"assigned_to": user["id"]}, {"presales_owner_id": user["id"]}, {"sales_owner_id": user["id"]}]
     docs = await db.site_visits.find(q, {"_id": 0}).sort("scheduled_at", 1).to_list(2000)
     return docs
 
@@ -3451,40 +3573,50 @@ async def create_visit(body: SiteVisitBody, actor: dict = Depends(get_current_us
     doc["status"] = "scheduled"
     doc["scheduled_at"] = doc["scheduled_at"].astimezone(timezone.utc).isoformat()
     doc["created_at"] = now_utc().isoformat()
+    lead = await require_lead_access(doc["lead_id"], actor)
+    if not doc.get("presales_owner_id"):
+        doc["presales_owner_id"] = doc.get("assigned_to") or lead.get("assigned_to")
     if not doc.get("assigned_to"):
-        lead = await db.leads.find_one({"id": doc["lead_id"]}, {"assigned_to": 1})
-        doc["assigned_to"] = (lead or {}).get("assigned_to")
+        doc["assigned_to"] = doc.get("presales_owner_id")
     await db.site_visits.insert_one(doc)
     doc.pop("_id", None)
     # advance lead to site_visit stage
     await db.leads.update_one({"id": doc["lead_id"]}, {"$set": {"stage": "site_visit", "updated_at": now_utc().isoformat()}})
     await log_activity(doc["lead_id"], actor, "site_visit_scheduled", f"Site visit scheduled at {doc['scheduled_at']}")
-    if doc.get("assigned_to"):
-        lead = await db.leads.find_one({"id": doc["lead_id"]}, {"name": 1, "_id": 0})
+    for owner_id in owner_ids_for_visit(doc):
         await create_notification(
             type="sitevisit_reminder",
             title="Site visit scheduled",
-            message=f"{(lead or {}).get('name', 'Lead')} · {doc['scheduled_at'][:16].replace('T', ' ')}",
-            user_id=doc["assigned_to"],
+            message=f"{lead.get('name', 'Lead')} · {doc['scheduled_at'][:16].replace('T', ' ')}",
+            user_id=owner_id,
             link=f"/leads/{doc['lead_id']}",
             meta={"visit_id": doc["id"]},
         )
-    return doc
+    await sync_site_visit_calendar_event(doc)
+    return sanitize_contact_doc(doc, actor)
 
 
 @api.patch("/site-visits/{visit_id}")
 async def update_visit(visit_id: str, body: UpdateSiteVisitBody, actor: dict = Depends(get_current_user)):
+    existing = await db.site_visits.find_one({"id": visit_id}, {"_id": 0})
+    if not existing:
+        raise HTTPException(status_code=404, detail="Site visit not found")
+    await require_lead_access(existing["lead_id"], actor)
     update = body.model_dump(exclude_none=True)
     if "scheduled_at" in update and isinstance(update["scheduled_at"], datetime):
         update["scheduled_at"] = update["scheduled_at"].astimezone(timezone.utc).isoformat()
     if not update:
         raise HTTPException(status_code=400, detail="Nothing to update")
+    if update.get("assigned_to") and not update.get("presales_owner_id"):
+        update["presales_owner_id"] = update["assigned_to"]
     r = await db.site_visits.update_one({"id": visit_id}, {"$set": update})
     if r.matched_count == 0:
         raise HTTPException(status_code=404, detail="Site visit not found")
     v = await db.site_visits.find_one({"id": visit_id}, {"_id": 0})
     if "status" in update:
         await log_activity(v["lead_id"], actor, "site_visit_" + update["status"], f"Site visit {update['status']}")
+    if any(k in update for k in ("scheduled_at", "status", "presales_owner_id", "sales_owner_id", "project_id")):
+        await sync_site_visit_calendar_event(v)
     return v
 
 
@@ -3504,7 +3636,7 @@ async def list_followups(lead_id: Optional[str] = None, status_q: Optional[str] 
         q["lead_id"] = lead_id
     if status_q:
         q["status"] = status_q
-    if user["role"] == "executive":
+    if user["role"] in {"executive", "sales"}:
         q["assigned_to"] = user["id"]
     docs = await db.follow_ups.find(q, {"_id": 0}).sort("due_at", 1).to_list(2000)
     return docs
@@ -3573,7 +3705,7 @@ async def analytics_summary(project_id: Optional[str] = None, user: dict = Depen
     match: dict = {}
     if project_id:
         match["project_id"] = project_id
-    if user["role"] == "executive":
+    if user["role"] in {"executive", "sales"}:
         match["assigned_to"] = user["id"]
 
     today_start = datetime.combine(now_utc().date(), datetime.min.time()).replace(tzinfo=timezone.utc).isoformat()
@@ -3647,8 +3779,17 @@ async def get_settings(user: dict = Depends(get_current_user)):
             "auto_call_on_new_lead": False,
             "missed_call_followup_enabled": True,
             "missed_call_followup_hours": 24,
+            "calling_provider": "pending",
+            "sms_provider": "pending",
+            "google_calendar_id": "",
+            "whatsapp_provider": "pending",
+            "whatsapp_service_url": "",
         }
         await db.settings.insert_one(s.copy())
+    if user.get("role") != "admin":
+        s.pop("google_calendar_credentials_json", None)
+        s.pop("whatsapp_access_token", None)
+        s.pop("whatsapp_instance_id", None)
     s.pop("_id", None)
     return s
 
@@ -3683,11 +3824,17 @@ class EmailLogBody(BaseDoc):
     template_id: Optional[str] = None
 
 
+async def get_integration_settings() -> dict:
+    return await db.settings.find_one({"id": "singleton"}, {"_id": 0}) or {}
+
+
+def _provider_configured(settings: dict, prefix: str) -> bool:
+    return bool(settings.get(f"{prefix}_service_url") and settings.get(f"{prefix}_access_token"))
+
+
 @api.post("/leads/{lead_id}/log-call")
 async def log_call(lead_id: str, body: CallLogBody, actor: dict = Depends(get_current_user)):
-    lead = await db.leads.find_one({"id": lead_id})
-    if not lead:
-        raise HTTPException(status_code=404, detail="Lead not found")
+    await require_lead_access(lead_id, actor)
     meta = body.model_dump()
     kind = "outgoing_call" if body.direction == "outgoing" else "incoming_call"
     if body.disposition in ("missed", "busy", "no_answer"):
@@ -3699,20 +3846,451 @@ async def log_call(lead_id: str, body: CallLogBody, actor: dict = Depends(get_cu
 
 @api.post("/leads/{lead_id}/log-sms")
 async def log_sms(lead_id: str, body: SmsLogBody, actor: dict = Depends(get_current_user)):
-    lead = await db.leads.find_one({"id": lead_id})
-    if not lead:
-        raise HTTPException(status_code=404, detail="Lead not found")
+    await require_lead_access(lead_id, actor)
     await log_activity(lead_id, actor, "sms_sent", body.text[:200], body.model_dump())
     return {"ok": True}
 
 
 @api.post("/leads/{lead_id}/log-email")
 async def log_email(lead_id: str, body: EmailLogBody, actor: dict = Depends(get_current_user)):
-    lead = await db.leads.find_one({"id": lead_id})
-    if not lead:
-        raise HTTPException(status_code=404, detail="Lead not found")
+    await require_lead_access(lead_id, actor)
     await log_activity(lead_id, actor, "email_sent", body.subject, body.model_dump())
     return {"ok": True}
+
+
+# ---------------------------------------------------------------------------
+# WHATSAPP CRM INTEGRATION
+# Based on the reference whatsapp-crm WhatsApp module:
+# backend/waziper/app.js exposes instance, QR, send_message and history routes;
+# app/Controllers/Whatsapp and MetaCloudService cover Meta embedded signup/webhooks.
+# ---------------------------------------------------------------------------
+class WhatsAppSendBody(BaseDoc):
+    text: str
+    template_id: Optional[str] = None
+
+
+class WhatsAppDirectSendBody(BaseDoc):
+    lead_id: str
+    text: str
+    template_id: Optional[str] = None
+
+
+class WhatsAppBulkSendBody(BaseDoc):
+    lead_ids: List[str]
+    text: str
+    template_id: Optional[str] = None
+
+
+class WhatsAppRuleBody(BaseDoc):
+    name: str
+    keywords: Optional[str] = None
+    reply_text: Optional[str] = None
+    active: Optional[bool] = True
+
+
+class WhatsAppFormBody(BaseDoc):
+    name: str
+    description: Optional[str] = None
+    fields: Optional[List[str]] = None
+    active: Optional[bool] = True
+
+
+def whatsapp_chat_id(phone: Optional[str]) -> Optional[str]:
+    digits = "".join(ch for ch in str(phone or "") if ch.isdigit())
+    if not digits:
+        return None
+    return f"{digits}@s.whatsapp.net"
+
+
+async def whatsapp_service_request(endpoint: str, settings: dict, params: Optional[dict] = None, data: Optional[dict] = None) -> dict:
+    service_url = (settings.get("whatsapp_service_url") or "").rstrip("/")
+    access_token = settings.get("whatsapp_access_token")
+    instance_id = settings.get("whatsapp_instance_id") or settings.get("whatsapp_number")
+    if not service_url or not access_token:
+        return {"status": "pending_credentials", "message": "WhatsApp service URL/access token is not configured"}
+    query = {"access_token": access_token}
+    if instance_id:
+        query["instance_id"] = instance_id
+    if params:
+        query.update({k: v for k, v in params.items() if v is not None})
+    url = f"{service_url}/{endpoint.lstrip('/')}?{urllib.parse.urlencode(query)}"
+
+    def _call() -> dict:
+        if data is None:
+            req = urllib.request.Request(url, method="GET")
+        else:
+            req = urllib.request.Request(
+                url,
+                data=json.dumps(data).encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            raw = resp.read().decode("utf-8")
+        return json.loads(raw) if raw else {"status": "success"}
+
+    try:
+        return await asyncio.to_thread(_call)
+    except Exception as exc:
+        log.warning("WhatsApp service request failed for %s: %s", endpoint, exc)
+        return {"status": "provider_error", "message": str(exc)}
+
+
+def sanitize_whatsapp_conversation(doc: dict, user: dict) -> dict:
+    clean(doc)
+    if user.get("role") == "admin":
+        return doc
+    if doc.get("contact_phone"):
+        doc["contact_phone"] = mask_phone(doc["contact_phone"])
+    doc.pop("chat_id", None)
+    return doc
+
+
+async def ensure_whatsapp_conversation_for_lead(lead: dict, actor: dict) -> dict:
+    chat_id = whatsapp_chat_id(lead.get("phone"))
+    if not chat_id:
+        raise HTTPException(status_code=400, detail="Lead has no WhatsApp-capable phone number")
+    existing = await db.whatsapp_conversations.find_one({"lead_id": lead["id"], "chat_id": chat_id}, {"_id": 0})
+    if existing:
+        return existing
+    now = now_utc().isoformat()
+    doc = {
+        "id": new_id(),
+        "lead_id": lead["id"],
+        "chat_id": chat_id,
+        "contact_name": lead.get("name"),
+        "contact_phone": lead.get("phone"),
+        "assigned_to": lead.get("assigned_to"),
+        "created_by": actor.get("id"),
+        "last_message": "",
+        "last_message_at": None,
+        "unread_count": 0,
+        "created_at": now,
+        "updated_at": now,
+    }
+    await db.whatsapp_conversations.insert_one(doc)
+    doc.pop("_id", None)
+    return doc
+
+
+async def forward_whatsapp_message(settings: dict, lead: dict, conversation: dict, text: str) -> dict:
+    result = await whatsapp_service_request(
+        "send_message",
+        settings,
+        data={"chat_id": conversation["chat_id"], "message": text, "caption": text, "type": "text"},
+    )
+    if result.get("status") == "pending_credentials":
+        return {"status": "pending_provider", "message": "WhatsApp service credentials are not configured"}
+    return result
+
+
+async def create_whatsapp_message_for_lead(lead: dict, body: WhatsAppSendBody, actor: dict) -> dict:
+    conv = await ensure_whatsapp_conversation_for_lead(lead, actor)
+    now = now_utc().isoformat()
+    provider_result = await forward_whatsapp_message(await get_integration_settings(), lead, conv, body.text)
+    msg = {
+        "id": new_id(),
+        "conversation_id": conv["id"],
+        "lead_id": lead["id"],
+        "direction": "outgoing",
+        "sender_id": actor.get("id"),
+        "sender_name": actor.get("name"),
+        "message_type": "text",
+        "text": body.text,
+        "template_id": body.template_id,
+        "provider_status": provider_result.get("status"),
+        "provider_response": provider_result,
+        "created_at": now,
+    }
+    await db.whatsapp_messages.insert_one(msg)
+    await db.whatsapp_conversations.update_one(
+        {"id": conv["id"]},
+        {"$set": {"last_message": body.text, "last_message_at": now, "updated_at": now}},
+    )
+    await log_activity(lead["id"], actor, "whatsapp", body.text[:200], {"conversation_id": conv["id"], "provider_status": provider_result.get("status")})
+    clean(msg)
+    return {"ok": True, "message": msg, "provider": provider_result, "conversation_id": conv["id"]}
+
+
+@api.get("/whatsapp/analytics")
+async def whatsapp_analytics(user: dict = Depends(get_current_user)):
+    q = {} if user.get("role") in {"admin", "manager"} else {"assigned_to": user["id"]}
+    conversations = await db.whatsapp_conversations.find(q, {"id": 1, "_id": 0}).to_list(2000)
+    conv_ids = [c["id"] for c in conversations]
+    msg_match = {"conversation_id": {"$in": conv_ids}} if conv_ids else {"conversation_id": "__none__"}
+    outbound_match = {**msg_match, "direction": "outgoing"}
+    pending_match = {**outbound_match, "provider_status": {"$in": ["pending_provider", "provider_error"]}}
+    now = now_utc()
+    month_start = datetime(now.year, now.month, 1, tzinfo=timezone.utc).isoformat()
+    sent_total, sent_month, pending, templates, active_rules, bot_rules = await asyncio.gather(
+        db.whatsapp_messages.count_documents(outbound_match),
+        db.whatsapp_messages.count_documents({**outbound_match, "created_at": {"$gte": month_start}}),
+        db.whatsapp_messages.count_documents(pending_match),
+        db.whatsapp_templates.count_documents({}),
+        db.whatsapp_autoresponders.count_documents({"active": True}),
+        db.whatsapp_chatbots.count_documents({"active": True}),
+    )
+    settings = await get_integration_settings()
+    credits = int(settings.get("whatsapp_credits") or 10000)
+    return {
+        "available_credits": credits,
+        "plan_limit": credits,
+        "messages_sent": sent_total,
+        "messages_this_month": sent_month,
+        "bulk_delivered": max(sent_total - pending, 0),
+        "delivery_success_pct": 100 if sent_total == 0 else round(((sent_total - pending) / sent_total) * 100, 1),
+        "autoresponder": active_rules,
+        "chatbot": bot_rules,
+        "templates": templates,
+        "conversations": len(conv_ids),
+    }
+
+
+@api.get("/whatsapp/status")
+async def whatsapp_status(user: dict = Depends(get_current_user)):
+    settings = await get_integration_settings()
+    configured = bool(settings.get("whatsapp_service_url") and settings.get("whatsapp_access_token"))
+    return {
+        "configured": configured,
+        "provider": settings.get("whatsapp_provider") or "pending",
+        "instance_id": settings.get("whatsapp_instance_id") if user.get("role") == "admin" else None,
+        "service_url": settings.get("whatsapp_service_url") if user.get("role") == "admin" else None,
+        "reference": {
+            "session_runtime": "backend/waziper",
+            "source_module": "C:/Marketly/whatsapp-crm/inc/core/Whatsapp",
+            "connect_routes": ["/instance", "/get_qrcode", "/logout"],
+            "message_routes": ["/send_message", "/send_template", "/send_by_template_id"],
+            "taskko_routes": ["/api/whatsapp/profile", "/api/whatsapp/qrcode", "/api/whatsapp/messages", "/api/whatsapp/bulk-send"],
+        },
+    }
+
+
+@api.post("/whatsapp/connect")
+async def whatsapp_connect(actor: dict = Depends(get_current_user)):
+    settings = await get_integration_settings()
+    if not settings.get("whatsapp_service_url") or not settings.get("whatsapp_access_token"):
+        return {"status": "pending_credentials", "message": "Configure WhatsApp service URL/access token before connecting"}
+    instance = await whatsapp_service_request("instance", settings)
+    return {"status": "ready", "connect_url": f"{settings['whatsapp_service_url'].rstrip('/')}/instance", "provider": instance}
+
+
+@api.get("/whatsapp/profile")
+async def whatsapp_profile(user: dict = Depends(get_current_user)):
+    settings = await get_integration_settings()
+    provider = await whatsapp_service_request("get_info", settings)
+    profile = {
+        "provider": settings.get("whatsapp_provider") or "pending",
+        "configured": bool(settings.get("whatsapp_service_url") and settings.get("whatsapp_access_token")),
+        "phone": settings.get("whatsapp_number"),
+        "instance_id": settings.get("whatsapp_instance_id"),
+        "service_url": settings.get("whatsapp_service_url") if user.get("role") == "admin" else None,
+        "provider_response": provider,
+    }
+    if user.get("role") != "admin":
+        profile["phone"] = mask_phone(profile.get("phone"))
+        profile["instance_id"] = None
+    return profile
+
+
+@api.get("/whatsapp/qrcode")
+async def whatsapp_qrcode(actor: dict = Depends(require_roles("admin", "manager"))):
+    settings = await get_integration_settings()
+    return await whatsapp_service_request("get_qrcode", settings)
+
+
+@api.post("/whatsapp/disconnect")
+async def whatsapp_disconnect(actor: dict = Depends(require_roles("admin", "manager"))):
+    settings = await get_integration_settings()
+    return await whatsapp_service_request("logout", settings)
+
+
+@api.get("/whatsapp/api")
+async def whatsapp_api_info(user: dict = Depends(get_current_user)):
+    settings = await get_integration_settings()
+    return {
+        "configured": bool(settings.get("whatsapp_service_url") and settings.get("whatsapp_access_token")),
+        "base_url": settings.get("whatsapp_service_url") if user.get("role") == "admin" else None,
+        "instance_id": settings.get("whatsapp_instance_id") if user.get("role") == "admin" else None,
+        "endpoints": [
+            {"method": "POST", "path": "/api/whatsapp/messages", "purpose": "Send a single lead WhatsApp message"},
+            {"method": "POST", "path": "/api/whatsapp/bulk-send", "purpose": "Send/queue a bulk WhatsApp message to selected leads"},
+            {"method": "GET", "path": "/api/whatsapp/conversations", "purpose": "List Taskko WhatsApp conversations"},
+            {"method": "GET", "path": "/api/whatsapp/qrcode", "purpose": "Fetch provider QR code when service credentials are configured"},
+        ],
+    }
+
+
+@api.get("/whatsapp/campaigns")
+async def whatsapp_campaigns(user: dict = Depends(get_current_user)):
+    q = {} if user.get("role") in {"admin", "manager"} else {"created_by": user["id"]}
+    return await db.whatsapp_campaigns.find(q, {"_id": 0}).sort("created_at", -1).to_list(100)
+
+
+@api.get("/whatsapp/autoresponders")
+async def list_whatsapp_autoresponders(user: dict = Depends(get_current_user)):
+    q = {} if user.get("role") in {"admin", "manager"} else {"created_by": user["id"]}
+    return await db.whatsapp_autoresponders.find(q, {"_id": 0}).sort("created_at", -1).to_list(100)
+
+
+@api.post("/whatsapp/autoresponders")
+async def create_whatsapp_autoresponder(body: WhatsAppRuleBody, actor: dict = Depends(require_roles("admin", "manager"))):
+    now = now_utc().isoformat()
+    doc = body.model_dump()
+    doc.update({"id": new_id(), "sent": 0, "failed": 0, "created_by": actor["id"], "created_at": now, "updated_at": now})
+    await db.whatsapp_autoresponders.insert_one(doc)
+    clean(doc)
+    return doc
+
+
+@api.patch("/whatsapp/autoresponders/{rule_id}")
+async def update_whatsapp_autoresponder(rule_id: str, body: WhatsAppRuleBody, actor: dict = Depends(require_roles("admin", "manager"))):
+    update = body.model_dump(exclude_none=True)
+    update["updated_at"] = now_utc().isoformat()
+    r = await db.whatsapp_autoresponders.update_one({"id": rule_id}, {"$set": update})
+    if r.matched_count == 0:
+        raise HTTPException(status_code=404, detail="Autoresponder not found")
+    return await db.whatsapp_autoresponders.find_one({"id": rule_id}, {"_id": 0})
+
+
+@api.delete("/whatsapp/autoresponders/{rule_id}")
+async def delete_whatsapp_autoresponder(rule_id: str, actor: dict = Depends(require_roles("admin", "manager"))):
+    await db.whatsapp_autoresponders.delete_one({"id": rule_id})
+    return {"ok": True}
+
+
+@api.get("/whatsapp/chatbots")
+async def list_whatsapp_chatbots(user: dict = Depends(get_current_user)):
+    q = {} if user.get("role") in {"admin", "manager"} else {"created_by": user["id"]}
+    return await db.whatsapp_chatbots.find(q, {"_id": 0}).sort("created_at", -1).to_list(100)
+
+
+@api.post("/whatsapp/chatbots")
+async def create_whatsapp_chatbot(body: WhatsAppRuleBody, actor: dict = Depends(require_roles("admin", "manager"))):
+    now = now_utc().isoformat()
+    doc = body.model_dump()
+    doc.update({"id": new_id(), "sent": 0, "failed": 0, "created_by": actor["id"], "created_at": now, "updated_at": now})
+    await db.whatsapp_chatbots.insert_one(doc)
+    clean(doc)
+    return doc
+
+
+@api.patch("/whatsapp/chatbots/{bot_id}")
+async def update_whatsapp_chatbot(bot_id: str, body: WhatsAppRuleBody, actor: dict = Depends(require_roles("admin", "manager"))):
+    update = body.model_dump(exclude_none=True)
+    update["updated_at"] = now_utc().isoformat()
+    r = await db.whatsapp_chatbots.update_one({"id": bot_id}, {"$set": update})
+    if r.matched_count == 0:
+        raise HTTPException(status_code=404, detail="Chatbot not found")
+    return await db.whatsapp_chatbots.find_one({"id": bot_id}, {"_id": 0})
+
+
+@api.delete("/whatsapp/chatbots/{bot_id}")
+async def delete_whatsapp_chatbot(bot_id: str, actor: dict = Depends(require_roles("admin", "manager"))):
+    await db.whatsapp_chatbots.delete_one({"id": bot_id})
+    return {"ok": True}
+
+
+@api.get("/whatsapp/forms")
+async def list_whatsapp_forms(user: dict = Depends(get_current_user)):
+    q = {} if user.get("role") in {"admin", "manager"} else {"created_by": user["id"]}
+    docs = await db.whatsapp_forms.find(q, {"_id": 0}).sort("created_at", -1).to_list(100)
+    for d in docs:
+        d["webhook_url"] = f"/api/integrations/whatsapp/forms/{d['id']}"
+    return docs
+
+
+@api.post("/whatsapp/forms")
+async def create_whatsapp_form(body: WhatsAppFormBody, actor: dict = Depends(require_roles("admin", "manager"))):
+    now = now_utc().isoformat()
+    doc = body.model_dump()
+    doc.update({"id": new_id(), "fields": doc.get("fields") or ["name", "phone", "email"], "created_by": actor["id"], "created_at": now, "updated_at": now})
+    await db.whatsapp_forms.insert_one(doc)
+    clean(doc)
+    doc["webhook_url"] = f"/api/integrations/whatsapp/forms/{doc['id']}"
+    return doc
+
+
+@api.delete("/whatsapp/forms/{form_id}")
+async def delete_whatsapp_form(form_id: str, actor: dict = Depends(require_roles("admin", "manager"))):
+    await db.whatsapp_forms.delete_one({"id": form_id})
+    return {"ok": True}
+
+
+@api.post("/whatsapp/messages")
+async def send_whatsapp_message(body: WhatsAppDirectSendBody, actor: dict = Depends(get_current_user)):
+    if not body.text.strip():
+        raise HTTPException(status_code=400, detail="Message text is required")
+    lead = await require_lead_access(body.lead_id, actor)
+    return await create_whatsapp_message_for_lead(lead, WhatsAppSendBody(text=body.text, template_id=body.template_id), actor)
+
+
+@api.post("/whatsapp/bulk-send")
+async def bulk_send_whatsapp(body: WhatsAppBulkSendBody, actor: dict = Depends(get_current_user)):
+    if not body.lead_ids:
+        raise HTTPException(status_code=400, detail="Select at least one lead")
+    if not body.text.strip():
+        raise HTTPException(status_code=400, detail="Message text is required")
+    campaign_id = new_id()
+    started_at = now_utc().isoformat()
+    sent, failed, results = 0, 0, []
+    for lead_id in body.lead_ids:
+        try:
+            lead = await require_lead_access(lead_id, actor)
+            result = await create_whatsapp_message_for_lead(lead, WhatsAppSendBody(text=body.text, template_id=body.template_id), actor)
+            sent += 1
+            results.append({"lead_id": lead_id, "ok": True, "provider_status": result.get("provider", {}).get("status")})
+        except Exception as exc:
+            failed += 1
+            results.append({"lead_id": lead_id, "ok": False, "error": getattr(exc, "detail", str(exc))})
+    campaign = {
+        "id": campaign_id,
+        "name": f"Bulk WhatsApp - {started_at[:10]}",
+        "message": body.text,
+        "template_id": body.template_id,
+        "lead_ids": body.lead_ids,
+        "sent": sent,
+        "failed": failed,
+        "pending": 0,
+        "status": "completed" if failed == 0 else "completed_with_errors",
+        "created_by": actor["id"],
+        "created_at": started_at,
+        "updated_at": now_utc().isoformat(),
+    }
+    await db.whatsapp_campaigns.insert_one(campaign)
+    return {"campaign_id": campaign_id, "sent": sent, "failed": failed, "results": results}
+
+
+@api.get("/whatsapp/conversations")
+async def whatsapp_conversations(user: dict = Depends(get_current_user)):
+    q = {} if user.get("role") in {"admin", "manager"} else {"assigned_to": user["id"]}
+    docs = await db.whatsapp_conversations.find(q, {"_id": 0}).sort("updated_at", -1).to_list(500)
+    return [sanitize_whatsapp_conversation(d, user) for d in docs]
+
+
+@api.get("/whatsapp/conversations/{conversation_id}/messages")
+async def whatsapp_messages(conversation_id: str, user: dict = Depends(get_current_user)):
+    conv = await db.whatsapp_conversations.find_one({"id": conversation_id}, {"_id": 0})
+    if not conv:
+        raise HTTPException(status_code=404, detail="Conversation not found")
+    if user.get("role") not in {"admin", "manager"} and conv.get("assigned_to") != user.get("id"):
+        raise HTTPException(status_code=403, detail="Conversation is not assigned to you")
+    return await db.whatsapp_messages.find({"conversation_id": conversation_id}, {"_id": 0}).sort("created_at", 1).to_list(500)
+
+
+@api.get("/leads/{lead_id}/whatsapp")
+async def lead_whatsapp(lead_id: str, user: dict = Depends(get_current_user)):
+    lead = await require_lead_access(lead_id, user)
+    conv = await ensure_whatsapp_conversation_for_lead(lead, user)
+    messages = await db.whatsapp_messages.find({"conversation_id": conv["id"]}, {"_id": 0}).sort("created_at", 1).to_list(500)
+    return {"conversation": sanitize_whatsapp_conversation(conv, user), "messages": messages}
+
+
+@api.post("/leads/{lead_id}/whatsapp/messages")
+async def send_lead_whatsapp(lead_id: str, body: WhatsAppSendBody, actor: dict = Depends(get_current_user)):
+    if not body.text.strip():
+        raise HTTPException(status_code=400, detail="Message text is required")
+    lead = await require_lead_access(lead_id, actor)
+    return await create_whatsapp_message_for_lead(lead, body, actor)
 
 
 # ---------------------------------------------------------------------------
@@ -3724,7 +4302,7 @@ class BulkAssignBody(BaseDoc):
 
 
 @api.post("/leads/bulk-assign")
-async def bulk_assign(body: BulkAssignBody, actor: dict = Depends(require_roles("admin", "manager"))):
+async def bulk_assign(body: BulkAssignBody, actor: dict = Depends(require_roles("admin"))):
     if not body.lead_ids:
         raise HTTPException(status_code=400, detail="No leads provided")
     user = await db.users.find_one({"id": body.user_id}, {"name": 1})
@@ -3761,7 +4339,7 @@ class ImportBody(BaseDoc):
 
 
 @api.post("/leads/import")
-async def import_leads(body: ImportBody, actor: dict = Depends(require_roles("admin", "manager"))):
+async def import_leads(body: ImportBody, actor: dict = Depends(require_roles("admin"))):
     projects = {p["name"].lower(): p["id"] async for p in db.projects.find({}, {"id": 1, "name": 1})}
     created, failed = 0, 0
     for row in body.rows:
@@ -3772,7 +4350,7 @@ async def import_leads(body: ImportBody, actor: dict = Depends(require_roles("ad
                 "name": row.name,
                 "phone": row.phone,
                 "email": row.email,
-                "source": row.source if row.source in ("magicbricks", "99acres", "commonfloor", "housing", "website", "google_ads", "facebook", "instagram", "referral", "walk_in", "manual") else "manual",
+                "source": row.source if row.source in ("magicbricks", "99acres", "commonfloor", "housing", "website", "jagathi_website", "google_ads", "facebook", "instagram", "referral", "walk_in", "manual") else "manual",
                 "project_id": pid,
                 "budget_min": row.budget_min,
                 "budget_max": row.budget_max,
@@ -3856,25 +4434,25 @@ async def list_partners(user: dict = Depends(get_current_user)):
     docs = await db.channel_partners.find({}, {"_id": 0}).sort("created_at", -1).to_list(500)
     for d in docs:
         d["leads_count"] = await db.leads.count_documents({"channel_partner_id": d["id"]})
-    return docs
+    return [sanitize_contact_doc(d, user) for d in docs]
 
 
 @api.post("/channel-partners")
-async def create_partner(body: ChannelPartnerBody, actor: dict = Depends(require_roles("admin", "manager"))):
+async def create_partner(body: ChannelPartnerBody, actor: dict = Depends(require_roles("admin"))):
     doc = body.model_dump()
     doc["id"] = new_id()
     doc["created_at"] = now_utc().isoformat()
     await db.channel_partners.insert_one(doc)
     doc.pop("_id", None)
-    return doc
+    return sanitize_contact_doc(doc, actor)
 
 
 @api.patch("/channel-partners/{pid}")
-async def update_partner(pid: str, body: ChannelPartnerBody, actor: dict = Depends(require_roles("admin", "manager"))):
+async def update_partner(pid: str, body: ChannelPartnerBody, actor: dict = Depends(require_roles("admin"))):
     r = await db.channel_partners.update_one({"id": pid}, {"$set": body.model_dump(exclude_none=True)})
     if r.matched_count == 0:
         raise HTTPException(status_code=404, detail="Partner not found")
-    return await db.channel_partners.find_one({"id": pid}, {"_id": 0})
+    return sanitize_contact_doc(await db.channel_partners.find_one({"id": pid}, {"_id": 0}), actor)
 
 
 @api.delete("/channel-partners/{pid}")
@@ -3958,7 +4536,7 @@ def _month_bounds(dt: datetime) -> tuple:
 async def dashboard_monthly(user: dict = Depends(get_current_user)):
     """Month's Updates tab data. Now fully parallelized."""
     scope: dict = {}
-    if user["role"] == "executive":
+    if user["role"] in {"executive", "sales"}:
         scope["assigned_to"] = user["id"]
 
     now = now_utc()
@@ -4048,16 +4626,16 @@ async def dashboard_monthly(user: dict = Depends(get_current_user)):
         "revenue": {"current": cur_revenue, "previous": prev_revenue, "change_pct": revenue_pct},
         "telemetry": telemetry,
         "pipeline": pipeline,
-        "top_leads": top,
-        "recent_inquiries": recent,
-        "upcoming_closures": closures_raw,
+        "top_leads": sanitize_many(top, user),
+        "recent_inquiries": sanitize_many(recent, user),
+        "upcoming_closures": sanitize_many(closures_raw, user),
     }
 
 
 @api.get("/dashboard/action-items")
 async def dashboard_action_items(user: dict = Depends(get_current_user)):
     scope: dict = {}
-    if user["role"] == "executive":
+    if user["role"] in {"executive", "sales"}:
         scope["assigned_to"] = user["id"]
 
     now = now_utc()
@@ -4091,8 +4669,8 @@ async def dashboard_action_items(user: dict = Depends(get_current_user)):
 
         called_ids, followed_ids = await asyncio.gather(get_called(), get_followed())
 
-    no_call_leads = [l for l in lead_docs if l["id"] not in called_ids][:12]
-    no_followup_leads = [l for l in lead_docs if l["id"] not in followed_ids][:12]
+    no_call_leads = sanitize_many([l for l in lead_docs if l["id"] not in called_ids][:12], user)
+    no_followup_leads = sanitize_many([l for l in lead_docs if l["id"] not in followed_ids][:12], user)
 
     return {
         "period": {"start": iso(day_start), "end": iso(day_end)},
@@ -4244,14 +4822,29 @@ async def _initiate_twilio_call(lead: dict, actor: dict) -> dict:
     return {"call_sid": call.sid, "status": call.status, "mock": False, "activity_id": activity_id}
 
 
+async def _initiate_call(lead: dict, actor: dict) -> dict:
+    settings = await get_integration_settings()
+    provider = (settings.get("calling_provider") or "twilio").lower()
+    if provider == "twilio":
+        return await _initiate_twilio_call(lead, actor)
+    activity_id = new_id()
+    await db.activities.insert_one({
+        "id": activity_id,
+        "lead_id": lead["id"],
+        "actor_id": actor.get("id"),
+        "actor_name": actor.get("name") or "system",
+        "kind": "outgoing_call",
+        "message": f"[PENDING] Call queued for {lead.get('name', 'Lead')}",
+        "meta": {"direction": "outgoing", "status": "pending_provider", "provider": provider},
+        "created_at": now_utc().isoformat(),
+    })
+    return {"call_sid": None, "status": "pending_provider", "provider": provider, "activity_id": activity_id}
+
+
 @api.post("/leads/{lead_id}/call")
 async def initiate_call(lead_id: str, actor: dict = Depends(get_current_user)):
-    lead = await db.leads.find_one({"id": lead_id})
-    if not lead:
-        raise HTTPException(status_code=404, detail="Lead not found")
-    if actor["role"] == "executive" and lead.get("assigned_to") != actor["id"]:
-        raise HTTPException(status_code=403, detail="You can only call your own leads")
-    return await _initiate_twilio_call(lead, actor)
+    lead = await require_lead_access(lead_id, actor)
+    return await _initiate_call(lead, actor)
 
 
 @api.api_route("/twilio/twiml/{lead_id}", methods=["GET", "POST"])
@@ -4393,6 +4986,19 @@ async def twilio_status(user: dict = Depends(get_current_user)):
     }
 
 
+@api.get("/calling/status")
+async def calling_status(user: dict = Depends(get_current_user)):
+    settings = await get_integration_settings()
+    provider = (settings.get("calling_provider") or "twilio").lower()
+    return {
+        "provider": provider,
+        "configured": bool(_twilio_client) if provider == "twilio" else False,
+        "from_number": TWILIO_FROM if provider == "twilio" and _twilio_client else None,
+        "webhook_base": BACKEND_PUBLIC_URL,
+        "status": "configured" if provider == "twilio" and _twilio_client else "pending_credentials",
+    }
+
+
 
 # ---------------------------------------------------------------------------
 # DASHBOARD DRILL-DOWNS
@@ -4409,7 +5015,7 @@ async def dashboard_revenue_breakdown(user: dict = Depends(get_current_user)):
         cur_end = datetime(now.year, now.month + 1, 1, tzinfo=timezone.utc)
 
     match: dict = {"status": "accepted", "created_at": {"$gte": cur_start.isoformat(), "$lt": cur_end.isoformat()}}
-    if user["role"] == "executive":
+    if user["role"] in {"executive", "sales"}:
         match["created_by"] = user["id"]
 
     # by agent
@@ -5329,7 +5935,7 @@ async def process_due_call_followups():
         if lead and assignee and lead.get("phone") and assignee.get("phone"):
             try:
                 log.info(f"Auto-dialing for follow-up {fu_id} (Lead: {lead_id})")
-                await _initiate_twilio_call(lead, assignee)
+                await _initiate_call(lead, assignee)
             except Exception as e:
                 log.warning(f"Failed to auto-dial follow-up {fu_id}: {e}")
 
