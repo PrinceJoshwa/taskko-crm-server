@@ -2834,6 +2834,20 @@ def mask_phone(value: Optional[str]) -> Optional[str]:
 
 
 PHONE_FIELDS = ("phone", "secondary_contact_phone")
+PHONE_META_KEYS = {
+    "phone",
+    "mobile",
+    "contact",
+    "contact_phone",
+    "secondary_contact_phone",
+    "alternate_phone",
+    "alt_phone",
+    "to",
+    "from",
+    "to_lead",
+    "to_exec",
+    "from_number",
+}
 
 
 def sanitize_phone_fields(doc: dict, user: dict) -> dict:
@@ -2849,6 +2863,27 @@ def sanitize_phone_fields(doc: dict, user: dict) -> dict:
 
 def sanitize_many(docs: list[dict], user: dict) -> list[dict]:
     return [sanitize_phone_fields(d, user) for d in docs]
+
+
+def sanitize_phone_meta(value, user: dict, key: Optional[str] = None):
+    if user.get("role") == "admin":
+        return value
+    normalized_key = key.lower() if key else None
+    if isinstance(value, dict):
+        return {k: sanitize_phone_meta(v, user, k) for k, v in value.items()}
+    if isinstance(value, list):
+        return [sanitize_phone_meta(v, user, key) for v in value]
+    if normalized_key in PHONE_META_KEYS and value and any(ch.isdigit() for ch in str(value)):
+        return mask_phone(str(value))
+    return value
+
+
+def sanitize_activity_doc(doc: dict, user: dict) -> dict:
+    if not doc:
+        return doc
+    sanitized = dict(doc)
+    sanitized["meta"] = sanitize_phone_meta(sanitized.get("meta") or {}, user)
+    return sanitized
 
 
 def sanitize_contact_doc(doc: dict, user: dict) -> dict:
@@ -3097,7 +3132,7 @@ async def login(body: LoginBody, response: Response):
     if user.get("active") is False:
         raise HTTPException(status_code=403, detail="Account is disabled")
     set_auth_cookies(response, user["id"], user["email"], user["role"])
-    return clean(user)
+    return sanitize_contact_doc(clean(user), user)
 
 
 @api.post("/auth/logout")
@@ -3617,7 +3652,7 @@ async def update_visit(visit_id: str, body: UpdateSiteVisitBody, actor: dict = D
         await log_activity(v["lead_id"], actor, "site_visit_" + update["status"], f"Site visit {update['status']}")
     if any(k in update for k in ("scheduled_at", "status", "presales_owner_id", "sales_owner_id", "project_id")):
         await sync_site_visit_calendar_event(v)
-    return v
+    return sanitize_contact_doc(v, actor)
 
 
 @api.delete("/site-visits/{visit_id}")
@@ -3693,8 +3728,16 @@ async def delete_followup(fu_id: str, actor: dict = Depends(get_current_user)):
 @api.get("/activities")
 async def list_activities(lead_id: Optional[str] = None, limit: int = 50, user: dict = Depends(get_current_user)):
     q = {"lead_id": lead_id} if lead_id else {}
+    if lead_id:
+        await require_lead_access(lead_id, user)
+    elif user.get("role") not in {"admin", "manager"}:
+        lead_ids = [
+            d["id"]
+            for d in await db.leads.find({"assigned_to": user["id"]}, {"id": 1, "_id": 0}).to_list(2000)
+        ]
+        q["lead_id"] = {"$in": lead_ids} if lead_ids else "__none__"
     docs = await db.activities.find(q, {"_id": 0}).sort("created_at", -1).to_list(limit)
-    return docs
+    return [sanitize_activity_doc(d, user) for d in docs]
 
 
 # ---------------------------------------------------------------------------
@@ -3787,6 +3830,8 @@ async def get_settings(user: dict = Depends(get_current_user)):
         }
         await db.settings.insert_one(s.copy())
     if user.get("role") != "admin":
+        if s.get("whatsapp_number"):
+            s["whatsapp_number"] = mask_phone(s["whatsapp_number"])
         s.pop("google_calendar_credentials_json", None)
         s.pop("whatsapp_access_token", None)
         s.pop("whatsapp_instance_id", None)
@@ -4979,9 +5024,10 @@ async def twilio_recording_callback(request: Request):
 
 @api.get("/twilio/status")
 async def twilio_status(user: dict = Depends(get_current_user)):
+    from_number = TWILIO_FROM if _twilio_client else None
     return {
         "configured": bool(_twilio_client),
-        "from_number": TWILIO_FROM if _twilio_client else None,
+        "from_number": from_number if user.get("role") == "admin" else mask_phone(from_number),
         "webhook_base": BACKEND_PUBLIC_URL,
     }
 
@@ -4990,10 +5036,11 @@ async def twilio_status(user: dict = Depends(get_current_user)):
 async def calling_status(user: dict = Depends(get_current_user)):
     settings = await get_integration_settings()
     provider = (settings.get("calling_provider") or "twilio").lower()
+    from_number = TWILIO_FROM if provider == "twilio" and _twilio_client else None
     return {
         "provider": provider,
         "configured": bool(_twilio_client) if provider == "twilio" else False,
-        "from_number": TWILIO_FROM if provider == "twilio" and _twilio_client else None,
+        "from_number": from_number if user.get("role") == "admin" else mask_phone(from_number),
         "webhook_base": BACKEND_PUBLIC_URL,
         "status": "configured" if provider == "twilio" and _twilio_client else "pending_credentials",
     }
