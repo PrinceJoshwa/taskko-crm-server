@@ -3999,6 +3999,56 @@ def whatsapp_chat_id(phone: Optional[str]) -> Optional[str]:
     return f"{digits}@s.whatsapp.net"
 
 
+def _walk_payload_values(payload, keys: set[str]):
+    if isinstance(payload, dict):
+        for key, value in payload.items():
+            if str(key).lower() in keys and value not in (None, ""):
+                yield value
+        for value in payload.values():
+            yield from _walk_payload_values(value, keys)
+    elif isinstance(payload, list):
+        for item in payload:
+            yield from _walk_payload_values(item, keys)
+
+
+def _first_payload_value(payload, keys: list[str]) -> Optional[str]:
+    for value in _walk_payload_values(payload, {k.lower() for k in keys}):
+        if isinstance(value, (str, int, float)):
+            return str(value)
+    return None
+
+
+def _extract_whatsapp_phone(payload: dict) -> Optional[str]:
+    raw = _first_payload_value(payload, ["chat_id", "remoteJid", "jid", "from", "sender", "number", "phone", "contact_phone", "wa_id"])
+    if not raw:
+        return None
+    raw = str(raw).split("@", 1)[0]
+    digits = "".join(ch for ch in raw if ch.isdigit())
+    return digits or None
+
+
+def _extract_whatsapp_text(payload: dict) -> str:
+    text = _first_payload_value(payload, ["text", "body", "message", "caption", "content"])
+    if text and not text.strip().startswith("{"):
+        return text.strip()
+    return "[WhatsApp message]"
+
+
+def _extract_whatsapp_message_id(payload: dict) -> Optional[str]:
+    return _first_payload_value(payload, ["message_id", "messageId", "wamid", "id"])
+
+
+async def _find_lead_by_phone_digits(phone_digits: str) -> Optional[dict]:
+    if not phone_digits:
+        return None
+    chat_id = whatsapp_chat_id(phone_digits)
+    conv = await db.whatsapp_conversations.find_one({"chat_id": chat_id}, {"_id": 0}) if chat_id else None
+    if conv and conv.get("lead_id"):
+        return await db.leads.find_one({"id": conv["lead_id"]}, {"_id": 0})
+    suffix = phone_digits[-10:] if len(phone_digits) >= 10 else phone_digits
+    return await db.leads.find_one({"phone": {"$regex": f"{suffix}$"}}, {"_id": 0})
+
+
 async def whatsapp_service_request(endpoint: str, settings: dict, params: Optional[dict] = None, data: Optional[dict] = None) -> dict:
     service_url = (settings.get("whatsapp_service_url") or "").rstrip("/")
     access_token = settings.get("whatsapp_access_token")
@@ -4189,7 +4239,14 @@ async def whatsapp_connect(actor: dict = Depends(require_roles("admin"))):
     if not settings.get("whatsapp_service_url") or not settings.get("whatsapp_access_token"):
         return {"status": "pending_credentials", "message": "Configure WhatsApp service URL/access token before connecting"}
     instance = await whatsapp_service_request("instance", settings)
-    return {"status": "ready", "connect_url": f"{settings['whatsapp_service_url'].rstrip('/')}/create_instance", "provider": instance}
+    webhook = None
+    if BACKEND_PUBLIC_URL:
+        webhook = await whatsapp_service_request(
+            "set_webhook",
+            settings,
+            data={"webhook_url": f"{BACKEND_PUBLIC_URL.rstrip('/')}/api/whatsapp/webhook", "enable": True},
+        )
+    return {"status": "ready", "connect_url": f"{settings['whatsapp_service_url'].rstrip('/')}/create_instance", "provider": instance, "webhook": webhook}
 
 
 @api.get("/whatsapp/profile")
@@ -4402,6 +4459,76 @@ async def whatsapp_messages(conversation_id: str, user: dict = Depends(require_r
     if user.get("role") not in {"admin", "manager"} and conv.get("assigned_to") != user.get("id"):
         raise HTTPException(status_code=403, detail="Conversation is not assigned to you")
     return await db.whatsapp_messages.find({"conversation_id": conversation_id}, {"_id": 0}).sort("created_at", 1).to_list(500)
+
+
+@api.api_route("/whatsapp/webhook", methods=["GET", "POST"])
+async def whatsapp_webhook(request: Request):
+    if request.method == "GET":
+        return {"ok": True}
+    content_type = request.headers.get("content-type") or ""
+    if "application/json" in content_type:
+        payload = await request.json()
+    else:
+        payload = dict(await request.form())
+
+    from_me = str(_first_payload_value(payload, ["fromMe", "from_me", "is_from_me"]) or "").lower()
+    direction_hint = str(_first_payload_value(payload, ["direction", "event", "type"]) or "").lower()
+    direction = "outgoing" if from_me in {"true", "1", "yes"} or "outgoing" in direction_hint else "incoming"
+    if direction != "incoming":
+        return {"ok": True, "ignored": "outgoing_status"}
+
+    phone_digits = _extract_whatsapp_phone(payload)
+    if not phone_digits:
+        return {"ok": False, "detail": "No WhatsApp sender phone found"}
+    chat_id = whatsapp_chat_id(phone_digits)
+    text = _extract_whatsapp_text(payload)
+    provider_message_id = _extract_whatsapp_message_id(payload)
+    if provider_message_id:
+        existing = await db.whatsapp_messages.find_one({"provider_message_id": provider_message_id}, {"_id": 0})
+        if existing:
+            return {"ok": True, "duplicate": True}
+
+    lead = await _find_lead_by_phone_digits(phone_digits)
+    now = now_utc().isoformat()
+    conv = await db.whatsapp_conversations.find_one({"chat_id": chat_id}, {"_id": 0}) if chat_id else None
+    if not conv:
+        conv = {
+            "id": new_id(),
+            "lead_id": (lead or {}).get("id"),
+            "chat_id": chat_id,
+            "contact_name": (lead or {}).get("name") or phone_digits,
+            "contact_phone": (lead or {}).get("phone") or phone_digits,
+            "assigned_to": (lead or {}).get("assigned_to"),
+            "created_by": None,
+            "last_message": "",
+            "last_message_at": None,
+            "unread_count": 0,
+            "created_at": now,
+            "updated_at": now,
+        }
+        await db.whatsapp_conversations.insert_one(conv)
+    msg = {
+        "id": new_id(),
+        "conversation_id": conv["id"],
+        "lead_id": (lead or {}).get("id") or conv.get("lead_id"),
+        "direction": "incoming",
+        "sender_id": None,
+        "sender_name": conv.get("contact_name") or phone_digits,
+        "message_type": "text",
+        "text": text,
+        "provider_message_id": provider_message_id,
+        "provider_status": "received",
+        "provider_response": payload,
+        "created_at": now,
+    }
+    await db.whatsapp_messages.insert_one(msg)
+    await db.whatsapp_conversations.update_one(
+        {"id": conv["id"]},
+        {"$set": {"last_message": text, "last_message_at": now, "updated_at": now, "lead_id": msg.get("lead_id"), "assigned_to": (lead or {}).get("assigned_to") or conv.get("assigned_to")}, "$inc": {"unread_count": 1}},
+    )
+    if lead:
+        await log_activity(lead["id"], {"name": "WhatsApp"}, "whatsapp", f"Incoming WhatsApp: {text[:160]}", {"conversation_id": conv["id"], "direction": "incoming"})
+    return {"ok": True, "conversation_id": conv["id"], "lead_id": msg.get("lead_id")}
 
 
 @api.get("/leads/{lead_id}/whatsapp")
