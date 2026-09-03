@@ -3101,6 +3101,10 @@ class SettingsBody(BaseDoc):
     whatsapp_service_url: Optional[str] = None
     whatsapp_access_token: Optional[str] = None
     whatsapp_instance_id: Optional[str] = None
+    callerdesk_base_url: Optional[str] = None
+    callerdesk_authcode: Optional[str] = None
+    callerdesk_virtual_number: Optional[str] = None
+    callerdesk_webhook_secret: Optional[str] = None
 
 
 # ---------------------------------------------------------------------------
@@ -3806,6 +3810,34 @@ async def analytics_summary(project_id: Optional[str] = None, user: dict = Depen
 # ---------------------------------------------------------------------------
 # SETTINGS (integration toggles)
 # ---------------------------------------------------------------------------
+def _env_integration_defaults() -> dict:
+    defaults = {
+        "whatsapp_provider": os.environ.get("WHATSAPP_PROVIDER", "").strip(),
+        "whatsapp_service_url": os.environ.get("WHATSAPP_SERVICE_URL", "").strip(),
+        "whatsapp_access_token": os.environ.get("WHATSAPP_ACCESS_TOKEN", "").strip(),
+        "whatsapp_instance_id": os.environ.get("WHATSAPP_INSTANCE_ID", "").strip(),
+        "whatsapp_number": os.environ.get("WHATSAPP_NUMBER", "").strip(),
+        "callerdesk_base_url": os.environ.get("CALLERDESK_BASE_URL", "").strip(),
+        "callerdesk_authcode": os.environ.get("CALLERDESK_AUTHCODE", "").strip(),
+        "callerdesk_virtual_number": os.environ.get("CALLERDESK_VIRTUAL_NUMBER", "").strip(),
+        "callerdesk_webhook_secret": os.environ.get("CALLERDESK_WEBHOOK_SECRET", "").strip(),
+    }
+    return {k: v for k, v in defaults.items() if v}
+
+
+def _with_env_integration_defaults(settings: Optional[dict]) -> dict:
+    merged = dict(settings or {})
+    defaults = _env_integration_defaults()
+    for key, value in defaults.items():
+        if not merged.get(key):
+            merged[key] = value
+    if defaults.get("whatsapp_service_url") and defaults.get("whatsapp_access_token"):
+        merged.setdefault("whatsapp_enabled", True)
+    if not merged.get("callerdesk_base_url"):
+        merged["callerdesk_base_url"] = "https://app.callerdesk.io/api"
+    return merged
+
+
 @api.get("/settings")
 async def get_settings(user: dict = Depends(get_current_user)):
     s = await db.settings.find_one({"id": "singleton"}, {"_id": 0})
@@ -3827,14 +3859,20 @@ async def get_settings(user: dict = Depends(get_current_user)):
             "google_calendar_id": "",
             "whatsapp_provider": "pending",
             "whatsapp_service_url": "",
+            "callerdesk_base_url": "https://app.callerdesk.io/api",
+            "callerdesk_authcode": "",
+            "callerdesk_virtual_number": "",
         }
         await db.settings.insert_one(s.copy())
+    s = _with_env_integration_defaults(s)
     if user.get("role") != "admin":
         if s.get("whatsapp_number"):
             s["whatsapp_number"] = mask_phone(s["whatsapp_number"])
         s.pop("google_calendar_credentials_json", None)
         s.pop("whatsapp_access_token", None)
         s.pop("whatsapp_instance_id", None)
+        s.pop("callerdesk_authcode", None)
+        s.pop("callerdesk_webhook_secret", None)
     s.pop("_id", None)
     return s
 
@@ -3853,7 +3891,7 @@ async def update_settings(body: SettingsBody, actor: dict = Depends(require_role
 class CallLogBody(BaseDoc):
     direction: Literal["outgoing", "incoming"] = "outgoing"
     duration_sec: int = 0
-    disposition: Literal["connected", "missed", "busy", "no_answer", "voicemail"] = "connected"
+    disposition: Literal["connected", "missed", "busy", "no_answer", "dnp", "voicemail"] = "connected"
     recording_url: Optional[str] = None
     notes: Optional[str] = None
 
@@ -3869,8 +3907,20 @@ class EmailLogBody(BaseDoc):
     template_id: Optional[str] = None
 
 
+class CallerDeskCampaignBody(BaseDoc):
+    name: str
+    lead_ids: Optional[List[str]] = None
+    numbers: Optional[List[str]] = None
+    calls_per_minute: Optional[int] = 3
+
+
+class CallerDeskCampaignPatchBody(BaseDoc):
+    name: Optional[str] = None
+    status: Optional[Literal["draft", "active", "paused", "completed", "cancelled"]] = None
+
+
 async def get_integration_settings() -> dict:
-    return await db.settings.find_one({"id": "singleton"}, {"_id": 0}) or {}
+    return _with_env_integration_defaults(await db.settings.find_one({"id": "singleton"}, {"_id": 0}))
 
 
 def _provider_configured(settings: dict, prefix: str) -> bool:
@@ -3883,6 +3933,8 @@ async def log_call(lead_id: str, body: CallLogBody, actor: dict = Depends(get_cu
     meta = body.model_dump()
     kind = "outgoing_call" if body.direction == "outgoing" else "incoming_call"
     if body.disposition in ("missed", "busy", "no_answer"):
+        kind = "missed_call"
+    if body.disposition == "dnp":
         kind = "missed_call"
     msg = f"{body.direction.capitalize()} call · {body.disposition} · {body.duration_sec}s"
     await log_activity(lead_id, actor, kind, msg, meta)
@@ -3953,20 +4005,40 @@ async def whatsapp_service_request(endpoint: str, settings: dict, params: Option
     instance_id = settings.get("whatsapp_instance_id") or settings.get("whatsapp_number")
     if not service_url or not access_token:
         return {"status": "pending_credentials", "message": "WhatsApp service URL/access token is not configured"}
+    provider_endpoint = {
+        "instance": "create_instance",
+        "create_instance": "create_instance",
+        "get_qrcode": "get_qrcode",
+        "send_message": "send",
+        "send": "send",
+        "logout": "logout",
+        "reboot": "reboot",
+        "reset_instance": "reset_instance",
+        "reconnect": "reconnect",
+        "set_webhook": "set_webhook",
+        "get_info": "get_info",
+    }.get(endpoint, endpoint)
     query = {"access_token": access_token}
     if instance_id:
         query["instance_id"] = instance_id
     if params:
         query.update({k: v for k, v in params.items() if v is not None})
-    url = f"{service_url}/{endpoint.lstrip('/')}?{urllib.parse.urlencode(query)}"
+    url = f"{service_url}/{provider_endpoint.lstrip('/')}?{urllib.parse.urlencode(query)}"
 
     def _call() -> dict:
-        if data is None:
+        post_only = provider_endpoint in {"create_instance", "get_qrcode", "set_webhook", "reboot", "reset_instance", "reconnect", "send"}
+        payload = None
+        if data is not None or post_only:
+            payload = dict(data or {})
+            payload.setdefault("access_token", access_token)
+            if instance_id:
+                payload.setdefault("instance_id", instance_id)
+        if payload is None:
             req = urllib.request.Request(url, method="GET")
         else:
             req = urllib.request.Request(
                 url,
-                data=json.dumps(data).encode("utf-8"),
+                data=json.dumps(payload).encode("utf-8"),
                 headers={"Content-Type": "application/json"},
                 method="POST",
             )
@@ -4019,10 +4091,11 @@ async def ensure_whatsapp_conversation_for_lead(lead: dict, actor: dict) -> dict
 
 
 async def forward_whatsapp_message(settings: dict, lead: dict, conversation: dict, text: str) -> dict:
+    number = "".join(ch for ch in str(lead.get("phone") or conversation.get("contact_phone") or "") if ch.isdigit())
     result = await whatsapp_service_request(
-        "send_message",
+        "send",
         settings,
-        data={"chat_id": conversation["chat_id"], "message": text, "caption": text, "type": "text"},
+        data={"number": number, "type": "text", "message": text},
     )
     if result.get("status") == "pending_credentials":
         return {"status": "pending_provider", "message": "WhatsApp service credentials are not configured"}
@@ -4058,7 +4131,7 @@ async def create_whatsapp_message_for_lead(lead: dict, body: WhatsAppSendBody, a
 
 
 @api.get("/whatsapp/analytics")
-async def whatsapp_analytics(user: dict = Depends(get_current_user)):
+async def whatsapp_analytics(user: dict = Depends(require_roles("admin"))):
     q = {} if user.get("role") in {"admin", "manager"} else {"assigned_to": user["id"]}
     conversations = await db.whatsapp_conversations.find(q, {"id": 1, "_id": 0}).to_list(2000)
     conv_ids = [c["id"] for c in conversations]
@@ -4092,7 +4165,7 @@ async def whatsapp_analytics(user: dict = Depends(get_current_user)):
 
 
 @api.get("/whatsapp/status")
-async def whatsapp_status(user: dict = Depends(get_current_user)):
+async def whatsapp_status(user: dict = Depends(require_roles("admin"))):
     settings = await get_integration_settings()
     configured = bool(settings.get("whatsapp_service_url") and settings.get("whatsapp_access_token"))
     return {
@@ -4103,24 +4176,24 @@ async def whatsapp_status(user: dict = Depends(get_current_user)):
         "reference": {
             "session_runtime": "backend/waziper",
             "source_module": "C:/Marketly/whatsapp-crm/inc/core/Whatsapp",
-            "connect_routes": ["/instance", "/get_qrcode", "/logout"],
-            "message_routes": ["/send_message", "/send_template", "/send_by_template_id"],
+            "connect_routes": ["/create_instance", "/get_qrcode", "/set_webhook", "/reboot", "/reset_instance", "/reconnect"],
+            "message_routes": ["/send"],
             "taskko_routes": ["/api/whatsapp/profile", "/api/whatsapp/qrcode", "/api/whatsapp/messages", "/api/whatsapp/bulk-send"],
         },
     }
 
 
 @api.post("/whatsapp/connect")
-async def whatsapp_connect(actor: dict = Depends(get_current_user)):
+async def whatsapp_connect(actor: dict = Depends(require_roles("admin"))):
     settings = await get_integration_settings()
     if not settings.get("whatsapp_service_url") or not settings.get("whatsapp_access_token"):
         return {"status": "pending_credentials", "message": "Configure WhatsApp service URL/access token before connecting"}
     instance = await whatsapp_service_request("instance", settings)
-    return {"status": "ready", "connect_url": f"{settings['whatsapp_service_url'].rstrip('/')}/instance", "provider": instance}
+    return {"status": "ready", "connect_url": f"{settings['whatsapp_service_url'].rstrip('/')}/create_instance", "provider": instance}
 
 
 @api.get("/whatsapp/profile")
-async def whatsapp_profile(user: dict = Depends(get_current_user)):
+async def whatsapp_profile(user: dict = Depends(require_roles("admin"))):
     settings = await get_integration_settings()
     provider = await whatsapp_service_request("get_info", settings)
     profile = {
@@ -4138,47 +4211,56 @@ async def whatsapp_profile(user: dict = Depends(get_current_user)):
 
 
 @api.get("/whatsapp/qrcode")
-async def whatsapp_qrcode(actor: dict = Depends(require_roles("admin", "manager"))):
+async def whatsapp_qrcode(actor: dict = Depends(require_roles("admin"))):
     settings = await get_integration_settings()
     return await whatsapp_service_request("get_qrcode", settings)
 
 
 @api.post("/whatsapp/disconnect")
-async def whatsapp_disconnect(actor: dict = Depends(require_roles("admin", "manager"))):
+async def whatsapp_disconnect(actor: dict = Depends(require_roles("admin"))):
     settings = await get_integration_settings()
     return await whatsapp_service_request("logout", settings)
 
 
 @api.get("/whatsapp/api")
-async def whatsapp_api_info(user: dict = Depends(get_current_user)):
+async def whatsapp_api_info(user: dict = Depends(require_roles("admin"))):
     settings = await get_integration_settings()
     return {
         "configured": bool(settings.get("whatsapp_service_url") and settings.get("whatsapp_access_token")),
         "base_url": settings.get("whatsapp_service_url") if user.get("role") == "admin" else None,
         "instance_id": settings.get("whatsapp_instance_id") if user.get("role") == "admin" else None,
         "endpoints": [
-            {"method": "POST", "path": "/api/whatsapp/messages", "purpose": "Send a single lead WhatsApp message"},
-            {"method": "POST", "path": "/api/whatsapp/bulk-send", "purpose": "Send/queue a bulk WhatsApp message to selected leads"},
+            {"method": "POST", "path": "/create_instance", "purpose": "Create a new WhatsApp instance ID"},
+            {"method": "POST", "path": "/get_qrcode", "purpose": "Return QR code for WhatsApp Web login"},
+            {"method": "POST", "path": "/set_webhook", "purpose": "Register receiving webhook for incoming/outgoing/status events"},
+            {"method": "POST", "path": "/reboot", "purpose": "Logout WhatsApp Web and request a fresh scan"},
+            {"method": "POST", "path": "/reset_instance", "purpose": "Reset instance and clear old instance data"},
+            {"method": "POST", "path": "/reconnect", "purpose": "Reconnect WhatsApp Web when connection is lost"},
+            {"method": "POST", "path": "/send", "purpose": "Send text/media/template messages with number, type and message payload"},
+        ],
+        "taskko_endpoints": [
+            {"method": "POST", "path": "/api/whatsapp/messages", "purpose": "Send a single lead WhatsApp message from Taskko"},
+            {"method": "POST", "path": "/api/whatsapp/bulk-send", "purpose": "Send or queue a bulk WhatsApp message to selected leads"},
             {"method": "GET", "path": "/api/whatsapp/conversations", "purpose": "List Taskko WhatsApp conversations"},
-            {"method": "GET", "path": "/api/whatsapp/qrcode", "purpose": "Fetch provider QR code when service credentials are configured"},
+            {"method": "GET", "path": "/api/whatsapp/qrcode", "purpose": "Fetch provider QR code using configured admin instance"},
         ],
     }
 
 
 @api.get("/whatsapp/campaigns")
-async def whatsapp_campaigns(user: dict = Depends(get_current_user)):
+async def whatsapp_campaigns(user: dict = Depends(require_roles("admin"))):
     q = {} if user.get("role") in {"admin", "manager"} else {"created_by": user["id"]}
     return await db.whatsapp_campaigns.find(q, {"_id": 0}).sort("created_at", -1).to_list(100)
 
 
 @api.get("/whatsapp/autoresponders")
-async def list_whatsapp_autoresponders(user: dict = Depends(get_current_user)):
+async def list_whatsapp_autoresponders(user: dict = Depends(require_roles("admin"))):
     q = {} if user.get("role") in {"admin", "manager"} else {"created_by": user["id"]}
     return await db.whatsapp_autoresponders.find(q, {"_id": 0}).sort("created_at", -1).to_list(100)
 
 
 @api.post("/whatsapp/autoresponders")
-async def create_whatsapp_autoresponder(body: WhatsAppRuleBody, actor: dict = Depends(require_roles("admin", "manager"))):
+async def create_whatsapp_autoresponder(body: WhatsAppRuleBody, actor: dict = Depends(require_roles("admin"))):
     now = now_utc().isoformat()
     doc = body.model_dump()
     doc.update({"id": new_id(), "sent": 0, "failed": 0, "created_by": actor["id"], "created_at": now, "updated_at": now})
@@ -4188,7 +4270,7 @@ async def create_whatsapp_autoresponder(body: WhatsAppRuleBody, actor: dict = De
 
 
 @api.patch("/whatsapp/autoresponders/{rule_id}")
-async def update_whatsapp_autoresponder(rule_id: str, body: WhatsAppRuleBody, actor: dict = Depends(require_roles("admin", "manager"))):
+async def update_whatsapp_autoresponder(rule_id: str, body: WhatsAppRuleBody, actor: dict = Depends(require_roles("admin"))):
     update = body.model_dump(exclude_none=True)
     update["updated_at"] = now_utc().isoformat()
     r = await db.whatsapp_autoresponders.update_one({"id": rule_id}, {"$set": update})
@@ -4198,19 +4280,19 @@ async def update_whatsapp_autoresponder(rule_id: str, body: WhatsAppRuleBody, ac
 
 
 @api.delete("/whatsapp/autoresponders/{rule_id}")
-async def delete_whatsapp_autoresponder(rule_id: str, actor: dict = Depends(require_roles("admin", "manager"))):
+async def delete_whatsapp_autoresponder(rule_id: str, actor: dict = Depends(require_roles("admin"))):
     await db.whatsapp_autoresponders.delete_one({"id": rule_id})
     return {"ok": True}
 
 
 @api.get("/whatsapp/chatbots")
-async def list_whatsapp_chatbots(user: dict = Depends(get_current_user)):
+async def list_whatsapp_chatbots(user: dict = Depends(require_roles("admin"))):
     q = {} if user.get("role") in {"admin", "manager"} else {"created_by": user["id"]}
     return await db.whatsapp_chatbots.find(q, {"_id": 0}).sort("created_at", -1).to_list(100)
 
 
 @api.post("/whatsapp/chatbots")
-async def create_whatsapp_chatbot(body: WhatsAppRuleBody, actor: dict = Depends(require_roles("admin", "manager"))):
+async def create_whatsapp_chatbot(body: WhatsAppRuleBody, actor: dict = Depends(require_roles("admin"))):
     now = now_utc().isoformat()
     doc = body.model_dump()
     doc.update({"id": new_id(), "sent": 0, "failed": 0, "created_by": actor["id"], "created_at": now, "updated_at": now})
@@ -4220,7 +4302,7 @@ async def create_whatsapp_chatbot(body: WhatsAppRuleBody, actor: dict = Depends(
 
 
 @api.patch("/whatsapp/chatbots/{bot_id}")
-async def update_whatsapp_chatbot(bot_id: str, body: WhatsAppRuleBody, actor: dict = Depends(require_roles("admin", "manager"))):
+async def update_whatsapp_chatbot(bot_id: str, body: WhatsAppRuleBody, actor: dict = Depends(require_roles("admin"))):
     update = body.model_dump(exclude_none=True)
     update["updated_at"] = now_utc().isoformat()
     r = await db.whatsapp_chatbots.update_one({"id": bot_id}, {"$set": update})
@@ -4230,13 +4312,13 @@ async def update_whatsapp_chatbot(bot_id: str, body: WhatsAppRuleBody, actor: di
 
 
 @api.delete("/whatsapp/chatbots/{bot_id}")
-async def delete_whatsapp_chatbot(bot_id: str, actor: dict = Depends(require_roles("admin", "manager"))):
+async def delete_whatsapp_chatbot(bot_id: str, actor: dict = Depends(require_roles("admin"))):
     await db.whatsapp_chatbots.delete_one({"id": bot_id})
     return {"ok": True}
 
 
 @api.get("/whatsapp/forms")
-async def list_whatsapp_forms(user: dict = Depends(get_current_user)):
+async def list_whatsapp_forms(user: dict = Depends(require_roles("admin"))):
     q = {} if user.get("role") in {"admin", "manager"} else {"created_by": user["id"]}
     docs = await db.whatsapp_forms.find(q, {"_id": 0}).sort("created_at", -1).to_list(100)
     for d in docs:
@@ -4245,7 +4327,7 @@ async def list_whatsapp_forms(user: dict = Depends(get_current_user)):
 
 
 @api.post("/whatsapp/forms")
-async def create_whatsapp_form(body: WhatsAppFormBody, actor: dict = Depends(require_roles("admin", "manager"))):
+async def create_whatsapp_form(body: WhatsAppFormBody, actor: dict = Depends(require_roles("admin"))):
     now = now_utc().isoformat()
     doc = body.model_dump()
     doc.update({"id": new_id(), "fields": doc.get("fields") or ["name", "phone", "email"], "created_by": actor["id"], "created_at": now, "updated_at": now})
@@ -4256,13 +4338,13 @@ async def create_whatsapp_form(body: WhatsAppFormBody, actor: dict = Depends(req
 
 
 @api.delete("/whatsapp/forms/{form_id}")
-async def delete_whatsapp_form(form_id: str, actor: dict = Depends(require_roles("admin", "manager"))):
+async def delete_whatsapp_form(form_id: str, actor: dict = Depends(require_roles("admin"))):
     await db.whatsapp_forms.delete_one({"id": form_id})
     return {"ok": True}
 
 
 @api.post("/whatsapp/messages")
-async def send_whatsapp_message(body: WhatsAppDirectSendBody, actor: dict = Depends(get_current_user)):
+async def send_whatsapp_message(body: WhatsAppDirectSendBody, actor: dict = Depends(require_roles("admin"))):
     if not body.text.strip():
         raise HTTPException(status_code=400, detail="Message text is required")
     lead = await require_lead_access(body.lead_id, actor)
@@ -4270,7 +4352,7 @@ async def send_whatsapp_message(body: WhatsAppDirectSendBody, actor: dict = Depe
 
 
 @api.post("/whatsapp/bulk-send")
-async def bulk_send_whatsapp(body: WhatsAppBulkSendBody, actor: dict = Depends(get_current_user)):
+async def bulk_send_whatsapp(body: WhatsAppBulkSendBody, actor: dict = Depends(require_roles("admin"))):
     if not body.lead_ids:
         raise HTTPException(status_code=400, detail="Select at least one lead")
     if not body.text.strip():
@@ -4306,14 +4388,14 @@ async def bulk_send_whatsapp(body: WhatsAppBulkSendBody, actor: dict = Depends(g
 
 
 @api.get("/whatsapp/conversations")
-async def whatsapp_conversations(user: dict = Depends(get_current_user)):
+async def whatsapp_conversations(user: dict = Depends(require_roles("admin"))):
     q = {} if user.get("role") in {"admin", "manager"} else {"assigned_to": user["id"]}
     docs = await db.whatsapp_conversations.find(q, {"_id": 0}).sort("updated_at", -1).to_list(500)
     return [sanitize_whatsapp_conversation(d, user) for d in docs]
 
 
 @api.get("/whatsapp/conversations/{conversation_id}/messages")
-async def whatsapp_messages(conversation_id: str, user: dict = Depends(get_current_user)):
+async def whatsapp_messages(conversation_id: str, user: dict = Depends(require_roles("admin"))):
     conv = await db.whatsapp_conversations.find_one({"id": conversation_id}, {"_id": 0})
     if not conv:
         raise HTTPException(status_code=404, detail="Conversation not found")
@@ -4323,7 +4405,7 @@ async def whatsapp_messages(conversation_id: str, user: dict = Depends(get_curre
 
 
 @api.get("/leads/{lead_id}/whatsapp")
-async def lead_whatsapp(lead_id: str, user: dict = Depends(get_current_user)):
+async def lead_whatsapp(lead_id: str, user: dict = Depends(require_roles("admin"))):
     lead = await require_lead_access(lead_id, user)
     conv = await ensure_whatsapp_conversation_for_lead(lead, user)
     messages = await db.whatsapp_messages.find({"conversation_id": conv["id"]}, {"_id": 0}).sort("created_at", 1).to_list(500)
@@ -4331,7 +4413,7 @@ async def lead_whatsapp(lead_id: str, user: dict = Depends(get_current_user)):
 
 
 @api.post("/leads/{lead_id}/whatsapp/messages")
-async def send_lead_whatsapp(lead_id: str, body: WhatsAppSendBody, actor: dict = Depends(get_current_user)):
+async def send_lead_whatsapp(lead_id: str, body: WhatsAppSendBody, actor: dict = Depends(require_roles("admin"))):
     if not body.text.strip():
         raise HTTPException(status_code=400, detail="Message text is required")
     lead = await require_lead_access(lead_id, actor)
@@ -4430,13 +4512,13 @@ class WATemplateBody(BaseDoc):
 
 
 @api.get("/whatsapp-templates")
-async def list_wa_templates(user: dict = Depends(get_current_user)):
+async def list_wa_templates(user: dict = Depends(require_roles("admin"))):
     docs = await db.whatsapp_templates.find({}, {"_id": 0}).sort("created_at", -1).to_list(500)
     return docs
 
 
 @api.post("/whatsapp-templates")
-async def create_wa_template(body: WATemplateBody, actor: dict = Depends(require_roles("admin", "manager"))):
+async def create_wa_template(body: WATemplateBody, actor: dict = Depends(require_roles("admin"))):
     doc = body.model_dump()
     doc["id"] = new_id()
     doc["created_at"] = now_utc().isoformat()
@@ -4446,7 +4528,7 @@ async def create_wa_template(body: WATemplateBody, actor: dict = Depends(require
 
 
 @api.patch("/whatsapp-templates/{tid}")
-async def update_wa_template(tid: str, body: WATemplateBody, actor: dict = Depends(require_roles("admin", "manager"))):
+async def update_wa_template(tid: str, body: WATemplateBody, actor: dict = Depends(require_roles("admin"))):
     r = await db.whatsapp_templates.update_one({"id": tid}, {"$set": body.model_dump(exclude_none=True)})
     if r.matched_count == 0:
         raise HTTPException(status_code=404, detail="Template not found")
@@ -4454,7 +4536,7 @@ async def update_wa_template(tid: str, body: WATemplateBody, actor: dict = Depen
 
 
 @api.delete("/whatsapp-templates/{tid}")
-async def delete_wa_template(tid: str, actor: dict = Depends(require_roles("admin", "manager"))):
+async def delete_wa_template(tid: str, actor: dict = Depends(require_roles("admin"))):
     await db.whatsapp_templates.delete_one({"id": tid})
     return {"ok": True}
 
@@ -4689,8 +4771,9 @@ async def dashboard_action_items(user: dict = Depends(get_current_user)):
     def iso(d): return d.isoformat()
 
     # Parallelize phase 1
-    (missed, todays_followups, scheduled_calls, tasks, planned_visits, lead_docs) = await asyncio.gather(
+    (missed, dnp_calls, todays_followups, scheduled_calls, tasks, planned_visits, lead_docs) = await asyncio.gather(
         db.activities.count_documents({"kind": "missed_call", "created_at": {"$gte": iso(day_start), "$lt": iso(day_end)}}),
+        db.activities.count_documents({"kind": "missed_call", "meta.disposition": "dnp", "created_at": {"$gte": iso(day_start), "$lt": iso(day_end)}}),
         db.follow_ups.find({**scope, "status": "pending", "due_at": {"$gte": iso(day_start), "$lt": iso(day_end)}}, {"_id": 0}).sort("due_at", 1).to_list(100),
         db.follow_ups.count_documents({**scope, "status": "pending", "kind": "call"}),
         db.follow_ups.count_documents({**scope, "status": "pending", "kind": {"$in": ["meeting", "email", "whatsapp"]}}),
@@ -4721,6 +4804,7 @@ async def dashboard_action_items(user: dict = Depends(get_current_user)):
         "period": {"start": iso(day_start), "end": iso(day_end)},
         "widgets": {
             "missed_calls": missed,
+            "dnp_calls": dnp_calls,
             "todays_followups": len(todays_followups),
             "scheduled_calls": scheduled_calls,
             "tasks": tasks,
@@ -4801,6 +4885,205 @@ def _looks_like_e164(num: str) -> bool:
     return bool(num) and num.startswith("+") and len(num) >= 8
 
 
+def _phone_digits(num: Optional[str], last10: bool = False) -> str:
+    digits = "".join(ch for ch in str(num or "") if ch.isdigit())
+    return digits[-10:] if last10 and len(digits) > 10 else digits
+
+
+def _callerdesk_configured(settings: dict) -> bool:
+    return bool(settings.get("callerdesk_authcode") and settings.get("callerdesk_virtual_number"))
+
+
+def _normalize_call_status(raw: Optional[str], duration_sec: int = 0) -> str:
+    status_text = str(raw or "").strip().lower().replace("-", "_").replace(" ", "_")
+    if status_text in {"dnp", "did_not_pick", "no_answer", "noanswer", "missed", "abandoned", "cancel", "canceled", "cancelled", "cancel_customer", "cancel_agent"}:
+        return "dnp"
+    if status_text in {"busy", "user_busy"}:
+        return "busy"
+    if status_text in {"failed", "error", "rejected"}:
+        return "failed"
+    if status_text in {"answer", "answered", "connected"}:
+        return "connected"
+    if status_text == "completed":
+        return "connected" if duration_sec > 0 else "dnp"
+    if status_text in {"queued", "initiated", "ringing", "in_progress", "dialing"}:
+        return status_text
+    return status_text or "initiated"
+
+
+def _call_kind(direction: str, status_text: str) -> str:
+    if status_text in {"dnp", "missed", "no_answer", "busy", "failed"}:
+        return "missed_call"
+    return "incoming_call" if direction == "incoming" else "outgoing_call"
+
+
+async def _callerdesk_api_request(method: str, endpoint: str, settings: dict, params: dict) -> dict:
+    base_url = (settings.get("callerdesk_base_url") or "https://app.callerdesk.io/api").rstrip("/")
+    payload = {k: v for k, v in (params or {}).items() if v is not None and v != ""}
+    payload["authcode"] = settings.get("callerdesk_authcode")
+    url = f"{base_url}/{endpoint.lstrip('/')}"
+
+    def _request() -> dict:
+        if method.upper() == "GET":
+            req_url = f"{url}?{urllib.parse.urlencode(payload)}"
+            req = urllib.request.Request(req_url, method="GET")
+        else:
+            data = urllib.parse.urlencode(payload).encode("utf-8")
+            req = urllib.request.Request(url, data=data, method=method.upper())
+            req.add_header("Content-Type", "application/x-www-form-urlencoded")
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            raw = resp.read().decode("utf-8", errors="replace")
+            try:
+                return json.loads(raw) if raw else {}
+            except json.JSONDecodeError:
+                return {"raw": raw}
+
+    return await asyncio.to_thread(_request)
+
+
+def _extract_callerdesk_sid(resp: dict) -> Optional[str]:
+    if not isinstance(resp, dict):
+        return None
+    candidates = [resp]
+    for key in ("data", "result", "response"):
+        if isinstance(resp.get(key), dict):
+            candidates.append(resp[key])
+    for item in candidates:
+        for key in ("sid_id", "call_sid", "CallSid", "sid", "id", "call_id"):
+            if item.get(key):
+                return str(item[key])
+    return None
+
+
+async def _save_callerdesk_call(
+    lead: Optional[dict],
+    actor: Optional[dict],
+    *,
+    call_sid: Optional[str],
+    direction: str,
+    status_text: str,
+    phone_from: Optional[str],
+    phone_to: Optional[str],
+    duration_sec: int = 0,
+    recording_url: Optional[str] = None,
+    campaign_id: Optional[str] = None,
+    campaign_number_id: Optional[str] = None,
+    raw: Optional[dict] = None,
+) -> str:
+    now = now_utc().isoformat()
+    call_id = new_id()
+    doc = {
+        "id": call_id,
+        "provider": "callerdesk",
+        "call_sid": call_sid,
+        "lead_id": (lead or {}).get("id"),
+        "lead_name": (lead or {}).get("name"),
+        "actor_id": (actor or {}).get("id"),
+        "actor_name": (actor or {}).get("name") or "system",
+        "direction": direction,
+        "status": status_text,
+        "duration_sec": duration_sec,
+        "phone_from": phone_from,
+        "phone_to": phone_to,
+        "recording_url": recording_url,
+        "campaign_id": campaign_id,
+        "campaign_number_id": campaign_number_id,
+        "raw": raw or {},
+        "created_at": now,
+        "updated_at": now,
+    }
+    if call_sid:
+        await db.callerdesk_calls.update_one({"call_sid": call_sid}, {"$set": doc}, upsert=True)
+    else:
+        await db.callerdesk_calls.insert_one(doc)
+
+    if lead:
+        activity = {
+            "lead_id": lead["id"],
+            "actor_id": (actor or {}).get("id"),
+            "actor_name": (actor or {}).get("name") or "system",
+            "kind": _call_kind(direction, status_text),
+            "message": f"CallerDesk call {status_text} · {duration_sec}s",
+            "meta": {
+                "provider": "callerdesk",
+                "direction": direction,
+                "status": status_text,
+                "disposition": status_text,
+                "call_sid": call_sid,
+                "duration_sec": duration_sec,
+                "phone_from": phone_from,
+                "phone_to": phone_to,
+                "recording_url": recording_url,
+                "campaign_id": campaign_id,
+            },
+        }
+        if call_sid:
+            existing_activity = await db.activities.find_one({"meta.call_sid": call_sid})
+            if existing_activity:
+                await db.activities.update_one({"id": existing_activity["id"]}, {"$set": activity})
+            else:
+                await db.activities.insert_one({"id": new_id(), **activity, "created_at": now})
+        else:
+            await db.activities.insert_one({"id": new_id(), **activity, "created_at": now})
+    return call_id
+
+
+async def _initiate_callerdesk_call(
+    lead: dict,
+    actor: dict,
+    *,
+    campaign_id: Optional[str] = None,
+    campaign_number_id: Optional[str] = None,
+) -> dict:
+    settings = await get_integration_settings()
+    if not lead.get("phone"):
+        raise HTTPException(status_code=400, detail="Lead has no phone number")
+    exec_phone = _phone_digits(actor.get("phone"), last10=True)
+    lead_phone = _phone_digits(lead.get("phone"))
+    if not exec_phone:
+        raise HTTPException(status_code=400, detail="Set your phone number on the Team page first")
+    if not _callerdesk_configured(settings):
+        call_id = await _save_callerdesk_call(
+            lead,
+            actor,
+            call_sid=None,
+            direction="outgoing",
+            status_text="pending_credentials",
+            phone_from=exec_phone,
+            phone_to=lead_phone,
+            campaign_id=campaign_id,
+            campaign_number_id=campaign_number_id,
+        )
+        return {"call_sid": None, "status": "pending_credentials", "provider": "callerdesk", "activity_id": call_id}
+
+    params = {
+        "calling_party_a": exec_phone,
+        "calling_party_b": lead_phone,
+        "deskphone": settings.get("callerdesk_virtual_number"),
+        "call_from_did": 1,
+    }
+    try:
+        resp = await _callerdesk_api_request("GET", "click_to_call_v2", settings, params)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"CallerDesk error: {e}")
+
+    call_sid = _extract_callerdesk_sid(resp)
+    status_text = _normalize_call_status(resp.get("status") or resp.get("callstatus") or "initiated")
+    call_id = await _save_callerdesk_call(
+        lead,
+        actor,
+        call_sid=call_sid,
+        direction="outgoing",
+        status_text=status_text,
+        phone_from=exec_phone,
+        phone_to=lead_phone,
+        campaign_id=campaign_id,
+        campaign_number_id=campaign_number_id,
+        raw=resp,
+    )
+    return {"call_sid": call_sid, "status": status_text, "provider": "callerdesk", "activity_id": call_id, "raw": resp}
+
+
 async def _initiate_twilio_call(lead: dict, actor: dict) -> dict:
     """Executive-first bridged call via Twilio. Rings the executive; on answer
     the TwiML dials the lead and records the conversation."""
@@ -4872,6 +5155,8 @@ async def _initiate_call(lead: dict, actor: dict) -> dict:
     provider = (settings.get("calling_provider") or "twilio").lower()
     if provider == "twilio":
         return await _initiate_twilio_call(lead, actor)
+    if provider == "callerdesk":
+        return await _initiate_callerdesk_call(lead, actor)
     activity_id = new_id()
     await db.activities.insert_one({
         "id": activity_id,
@@ -4890,6 +5175,316 @@ async def _initiate_call(lead: dict, actor: dict) -> dict:
 async def initiate_call(lead_id: str, actor: dict = Depends(get_current_user)):
     lead = await require_lead_access(lead_id, actor)
     return await _initiate_call(lead, actor)
+
+
+async def _expire_old_callerdesk_campaign_calls(campaign_id: Optional[str] = None) -> int:
+    cutoff = (now_utc() - timedelta(days=2)).isoformat()
+    q = {
+        "status": {"$in": ["pending", "dialing", "initiated", "ringing", "queued"]},
+        "$or": [{"last_attempted_at": {"$lte": cutoff}}, {"created_at": {"$lte": cutoff}}],
+    }
+    if campaign_id:
+        q["campaign_id"] = campaign_id
+    update = {
+        "$set": {
+            "status": "dnp",
+            "completed_at": now_utc().isoformat(),
+            "updated_at": now_utc().isoformat(),
+            "notes": "Auto-marked DNP after pending for more than 2 days",
+        }
+    }
+    res = await db.callerdesk_campaign_numbers.update_many(q, update)
+    return int(res.modified_count or 0)
+
+
+def _callerdesk_filter_query(
+    status_filter: Optional[str],
+    direction: Optional[str],
+    date_from: Optional[str],
+    date_to: Optional[str],
+    search: Optional[str],
+    campaign_id: Optional[str] = None,
+) -> dict:
+    q: dict = {}
+    if campaign_id:
+        q["campaign_id"] = campaign_id
+    if status_filter and status_filter != "all":
+        q["status"] = _normalize_call_status(status_filter) if status_filter == "dnp" else status_filter
+    if direction and direction != "all":
+        q["direction"] = direction
+    if date_from or date_to:
+        q["created_at"] = {}
+        if date_from:
+            q["created_at"]["$gte"] = date_from
+        if date_to:
+            q["created_at"]["$lte"] = date_to
+    if search:
+        safe = {"$regex": search, "$options": "i"}
+        q["$or"] = [{"phone_from": safe}, {"phone_to": safe}, {"call_sid": safe}, {"lead_name": safe}]
+    return q
+
+
+def _mask_call_row(row: dict, user: dict) -> dict:
+    row.pop("_id", None)
+    if user.get("role") != "admin":
+        row["phone_from"] = mask_phone(row.get("phone_from"))
+        row["phone_to"] = mask_phone(row.get("phone_to"))
+    return row
+
+
+@api.get("/callerdesk/status")
+async def callerdesk_status(user: dict = Depends(get_current_user)):
+    settings = await get_integration_settings()
+    configured = _callerdesk_configured(settings)
+    virtual_number = settings.get("callerdesk_virtual_number")
+    return {
+        "provider": (settings.get("calling_provider") or "pending").lower(),
+        "configured": configured,
+        "base_url": settings.get("callerdesk_base_url") or "https://app.callerdesk.io/api",
+        "virtual_number": virtual_number if user.get("role") == "admin" else mask_phone(virtual_number),
+        "webhook_url": f"{BACKEND_PUBLIC_URL.rstrip('/')}/api/callerdesk/webhook" if BACKEND_PUBLIC_URL else "/api/callerdesk/webhook",
+        "status": "configured" if configured else "pending_credentials",
+    }
+
+
+@api.get("/callerdesk/dashboard")
+async def callerdesk_dashboard(user: dict = Depends(require_roles("admin", "manager"))):
+    await _expire_old_callerdesk_campaign_calls()
+    today_start = datetime(now_utc().year, now_utc().month, now_utc().day, tzinfo=timezone.utc).isoformat()
+    q_today = {"created_at": {"$gte": today_start}}
+    total_calls = await db.callerdesk_calls.count_documents(q_today)
+    connected = await db.callerdesk_calls.count_documents({**q_today, "status": {"$in": ["connected", "completed", "answer", "answered"]}})
+    dnp = await db.callerdesk_calls.count_documents({**q_today, "status": "dnp"})
+    failed = await db.callerdesk_calls.count_documents({**q_today, "status": {"$in": ["failed", "busy"]}})
+    active_campaigns = await db.callerdesk_campaigns.count_documents({"status": "active"})
+    pending_campaign_calls = await db.callerdesk_campaign_numbers.count_documents({"status": {"$in": ["pending", "dialing", "initiated", "ringing", "queued"]}})
+    return {
+        "total_calls": total_calls,
+        "connected": connected,
+        "dnp": dnp,
+        "failed": failed,
+        "active_campaigns": active_campaigns,
+        "pending_campaign_calls": pending_campaign_calls,
+    }
+
+
+@api.get("/callerdesk/call-logs")
+async def callerdesk_call_logs(
+    status_filter: Optional[str] = Query(None, alias="status"),
+    direction: Optional[str] = None,
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
+    search: Optional[str] = None,
+    user: dict = Depends(require_roles("admin", "manager")),
+):
+    q = _callerdesk_filter_query(status_filter, direction, date_from, date_to, search)
+    rows = await db.callerdesk_calls.find(q).sort("created_at", -1).limit(250).to_list(250)
+    return {"items": [_mask_call_row(r, user) for r in rows]}
+
+
+@api.get("/callerdesk/campaigns")
+async def callerdesk_campaigns(
+    status_filter: Optional[str] = Query(None, alias="status"),
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
+    search: Optional[str] = None,
+    user: dict = Depends(require_roles("admin", "manager")),
+):
+    await _expire_old_callerdesk_campaign_calls()
+    q: dict = {}
+    if status_filter and status_filter != "all":
+        q["status"] = status_filter
+    if date_from or date_to:
+        q["created_at"] = {}
+        if date_from:
+            q["created_at"]["$gte"] = date_from
+        if date_to:
+            q["created_at"]["$lte"] = date_to
+    if search:
+        q["$or"] = [{"name": {"$regex": search, "$options": "i"}}]
+    campaigns = await db.callerdesk_campaigns.find(q, {"_id": 0}).sort("created_at", -1).limit(100).to_list(100)
+    for c in campaigns:
+        cid = c["id"]
+        c["total_numbers"] = await db.callerdesk_campaign_numbers.count_documents({"campaign_id": cid})
+        c["pending_numbers"] = await db.callerdesk_campaign_numbers.count_documents({"campaign_id": cid, "status": {"$in": ["pending", "dialing", "initiated", "ringing", "queued"]}})
+        c["dnp_numbers"] = await db.callerdesk_campaign_numbers.count_documents({"campaign_id": cid, "status": "dnp"})
+        c["connected_numbers"] = await db.callerdesk_campaign_numbers.count_documents({"campaign_id": cid, "status": "connected"})
+    return {"items": campaigns}
+
+
+@api.post("/callerdesk/campaigns")
+async def create_callerdesk_campaign(body: CallerDeskCampaignBody, actor: dict = Depends(require_roles("admin", "manager"))):
+    lead_ids = list(dict.fromkeys(body.lead_ids or []))
+    leads = []
+    if lead_ids:
+        leads = await db.leads.find({"id": {"$in": lead_ids}}, {"_id": 0}).to_list(len(lead_ids))
+    numbers = list(dict.fromkeys([n for n in (body.numbers or []) if _phone_digits(n)]))
+    for lead in leads:
+        if lead.get("phone"):
+            numbers.append(lead["phone"])
+    numbers = list(dict.fromkeys(numbers))
+    if not numbers:
+        raise HTTPException(status_code=400, detail="Add at least one lead or phone number")
+    cid = new_id()
+    now = now_utc().isoformat()
+    campaign = {
+        "id": cid,
+        "name": body.name.strip(),
+        "status": "draft",
+        "calls_per_minute": max(1, min(int(body.calls_per_minute or 3), 20)),
+        "created_by": actor["id"],
+        "created_by_name": actor.get("name"),
+        "created_at": now,
+        "updated_at": now,
+    }
+    await db.callerdesk_campaigns.insert_one(campaign)
+    lead_by_phone = {_phone_digits(l.get("phone")): l for l in leads}
+    docs = []
+    for raw in numbers:
+        digits = _phone_digits(raw)
+        lead = lead_by_phone.get(digits)
+        docs.append({
+            "id": new_id(),
+            "campaign_id": cid,
+            "lead_id": (lead or {}).get("id"),
+            "lead_name": (lead or {}).get("name"),
+            "phone": digits,
+            "status": "pending",
+            "attempts": 0,
+            "duration_sec": 0,
+            "call_sid": None,
+            "created_at": now,
+            "updated_at": now,
+        })
+    await db.callerdesk_campaign_numbers.insert_many(docs)
+    campaign.pop("_id", None)
+    return campaign
+
+
+@api.patch("/callerdesk/campaigns/{campaign_id}")
+async def update_callerdesk_campaign(campaign_id: str, body: CallerDeskCampaignPatchBody, actor: dict = Depends(require_roles("admin", "manager"))):
+    update = body.model_dump(exclude_none=True)
+    if update:
+        update["updated_at"] = now_utc().isoformat()
+        await db.callerdesk_campaigns.update_one({"id": campaign_id}, {"$set": update})
+    doc = await db.callerdesk_campaigns.find_one({"id": campaign_id}, {"_id": 0})
+    if not doc:
+        raise HTTPException(status_code=404, detail="Campaign not found")
+    return doc
+
+
+async def _run_callerdesk_campaign_batch(campaign_id: str, actor: dict) -> dict:
+    campaign = await db.callerdesk_campaigns.find_one({"id": campaign_id})
+    if not campaign:
+        raise HTTPException(status_code=404, detail="Campaign not found")
+    await _expire_old_callerdesk_campaign_calls(campaign_id)
+    limit = max(1, min(int(campaign.get("calls_per_minute") or 3), 20))
+    items = await db.callerdesk_campaign_numbers.find({"campaign_id": campaign_id, "status": "pending"}).limit(limit).to_list(limit)
+    started = 0
+    for item in items:
+        lead = await db.leads.find_one({"id": item.get("lead_id")}, {"_id": 0}) if item.get("lead_id") else None
+        lead = lead or {"id": None, "name": item.get("phone"), "phone": item.get("phone")}
+        try:
+            result = await _initiate_callerdesk_call(lead, actor, campaign_id=campaign_id, campaign_number_id=item["id"])
+            status_text = _normalize_call_status(result.get("status") or "initiated")
+            await db.callerdesk_campaign_numbers.update_one(
+                {"id": item["id"]},
+                {"$set": {"status": status_text, "call_sid": result.get("call_sid"), "last_attempted_at": now_utc().isoformat(), "updated_at": now_utc().isoformat()}, "$inc": {"attempts": 1}},
+            )
+            started += 1
+        except Exception as e:
+            await db.callerdesk_campaign_numbers.update_one(
+                {"id": item["id"]},
+                {"$set": {"status": "failed", "notes": str(e), "updated_at": now_utc().isoformat()}, "$inc": {"attempts": 1}},
+            )
+    pending = await db.callerdesk_campaign_numbers.count_documents({"campaign_id": campaign_id, "status": "pending"})
+    new_status = "completed" if pending == 0 else "active"
+    await db.callerdesk_campaigns.update_one({"id": campaign_id}, {"$set": {"status": new_status, "updated_at": now_utc().isoformat()}})
+    return {"started": started, "pending": pending, "status": new_status}
+
+
+@api.post("/callerdesk/campaigns/{campaign_id}/start")
+async def start_callerdesk_campaign(campaign_id: str, actor: dict = Depends(require_roles("admin", "manager"))):
+    await db.callerdesk_campaigns.update_one({"id": campaign_id}, {"$set": {"status": "active", "updated_at": now_utc().isoformat()}})
+    return await _run_callerdesk_campaign_batch(campaign_id, actor)
+
+
+@api.post("/callerdesk/campaigns/{campaign_id}/pause")
+async def pause_callerdesk_campaign(campaign_id: str, actor: dict = Depends(require_roles("admin", "manager"))):
+    await db.callerdesk_campaigns.update_one({"id": campaign_id}, {"$set": {"status": "paused", "updated_at": now_utc().isoformat()}})
+    return {"ok": True}
+
+
+@api.delete("/callerdesk/campaigns/{campaign_id}")
+async def delete_callerdesk_campaign(campaign_id: str, actor: dict = Depends(require_roles("admin", "manager"))):
+    await db.callerdesk_campaigns.update_one({"id": campaign_id}, {"$set": {"status": "cancelled", "updated_at": now_utc().isoformat()}})
+    await db.callerdesk_campaign_numbers.update_many({"campaign_id": campaign_id, "status": "pending"}, {"$set": {"status": "cancelled", "updated_at": now_utc().isoformat()}})
+    return {"ok": True}
+
+
+@api.get("/callerdesk/campaigns/{campaign_id}/calls")
+async def callerdesk_campaign_calls(
+    campaign_id: str,
+    status_filter: Optional[str] = Query(None, alias="status"),
+    search: Optional[str] = None,
+    user: dict = Depends(require_roles("admin", "manager")),
+):
+    await _expire_old_callerdesk_campaign_calls(campaign_id)
+    q: dict = {"campaign_id": campaign_id}
+    if status_filter and status_filter != "all":
+        q["status"] = status_filter
+    if search:
+        safe = {"$regex": search, "$options": "i"}
+        q["$or"] = [{"phone": safe}, {"call_sid": safe}, {"lead_name": safe}]
+    rows = await db.callerdesk_campaign_numbers.find(q, {"_id": 0}).sort("created_at", -1).limit(500).to_list(500)
+    if user.get("role") != "admin":
+        for row in rows:
+            row["phone"] = mask_phone(row.get("phone"))
+    return {"items": rows}
+
+
+@api.post("/callerdesk/webhook")
+async def callerdesk_webhook(request: Request):
+    content_type = request.headers.get("content-type") or ""
+    if "application/json" in content_type:
+        payload = await request.json()
+    else:
+        payload = dict(await request.form())
+    settings = await get_integration_settings()
+    secret = settings.get("callerdesk_webhook_secret")
+    if secret and payload.get("secret") != secret and request.headers.get("X-CallerDesk-Secret") != secret:
+        return StarletteResponse(status_code=403)
+    call_sid = payload.get("sid_id") or payload.get("call_sid") or payload.get("CallSid") or payload.get("id")
+    duration = int(payload.get("talk_duration") or payload.get("total_duration") or payload.get("CallDuration") or payload.get("duration") or 0)
+    status_text = _normalize_call_status(payload.get("callstatus") or payload.get("status") or payload.get("Status"), duration)
+    direction = "outgoing" if str(payload.get("callresult") or payload.get("Flow_type") or "").upper() in {"WEBOBD", "CLICK-TO-CALL", "CLICK_TO_CALL"} else (payload.get("direction") or "incoming")
+    phone_from = payload.get("caller_num") or payload.get("caller_number") or payload.get("from") or payload.get("From")
+    phone_to = payload.get("member_num") or payload.get("destination_number") or payload.get("to") or payload.get("To")
+    recording_url = payload.get("file") or payload.get("recording_url") or payload.get("RecordingUrl")
+
+    call = await db.callerdesk_calls.find_one({"call_sid": call_sid}) if call_sid else None
+    lead = await db.leads.find_one({"id": call.get("lead_id")}, {"_id": 0}) if call and call.get("lead_id") else None
+    actor = await db.users.find_one({"id": call.get("actor_id")}, {"_id": 0}) if call and call.get("actor_id") else {"name": "CallerDesk"}
+    await _save_callerdesk_call(
+        lead,
+        actor,
+        call_sid=call_sid,
+        direction=direction,
+        status_text=status_text,
+        phone_from=phone_from,
+        phone_to=phone_to,
+        duration_sec=duration,
+        recording_url=recording_url,
+        campaign_id=(call or {}).get("campaign_id"),
+        campaign_number_id=(call or {}).get("campaign_number_id"),
+        raw=payload,
+    )
+    if call and call.get("campaign_number_id"):
+        await db.callerdesk_campaign_numbers.update_one(
+            {"id": call["campaign_number_id"]},
+            {"$set": {"status": status_text, "duration_sec": duration, "call_sid": call_sid, "updated_at": now_utc().isoformat()}},
+        )
+    return {"ok": True}
 
 
 @api.api_route("/twilio/twiml/{lead_id}", methods=["GET", "POST"])
@@ -4954,7 +5549,7 @@ async def twilio_status_callback(request: Request):
     unsuccessful = {"no-answer", "busy", "failed", "canceled"}
     dur_i = int(meta.get("duration_sec") or 0)
     is_missed = call_status in unsuccessful or (call_status == "completed" and dur_i == 0)
-    disposition = call_status.replace("-", "_") if is_missed else "connected"
+    disposition = _normalize_call_status(call_status, dur_i) if is_missed else "connected"
     meta["disposition"] = disposition
     kind = "missed_call" if is_missed else "outgoing_call"
 
@@ -5037,12 +5632,17 @@ async def calling_status(user: dict = Depends(get_current_user)):
     settings = await get_integration_settings()
     provider = (settings.get("calling_provider") or "twilio").lower()
     from_number = TWILIO_FROM if provider == "twilio" and _twilio_client else None
+    if provider == "callerdesk":
+        from_number = settings.get("callerdesk_virtual_number")
+        configured = _callerdesk_configured(settings)
+    else:
+        configured = bool(_twilio_client) if provider == "twilio" else False
     return {
         "provider": provider,
-        "configured": bool(_twilio_client) if provider == "twilio" else False,
+        "configured": configured,
         "from_number": from_number if user.get("role") == "admin" else mask_phone(from_number),
         "webhook_base": BACKEND_PUBLIC_URL,
-        "status": "configured" if provider == "twilio" and _twilio_client else "pending_credentials",
+        "status": "configured" if configured else "pending_credentials",
     }
 
 
