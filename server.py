@@ -4240,11 +4240,14 @@ async def whatsapp_connect(actor: dict = Depends(require_roles("admin"))):
         return {"status": "pending_credentials", "message": "Configure WhatsApp service URL/access token before connecting"}
     instance = await whatsapp_service_request("instance", settings)
     webhook = None
-    if BACKEND_PUBLIC_URL:
+    webhook_url = WHATSAPP_WEBHOOK_URL or (
+        f"{BACKEND_PUBLIC_URL.rstrip('/')}/api/whatsapp/webhook" if BACKEND_PUBLIC_URL else ""
+    )
+    if webhook_url:
         webhook = await whatsapp_service_request(
             "set_webhook",
             settings,
-            data={"webhook_url": f"{BACKEND_PUBLIC_URL.rstrip('/')}/api/whatsapp/webhook", "enable": True},
+            data={"webhook_url": webhook_url, "enable": True},
         )
     return {"status": "ready", "connect_url": f"{settings['whatsapp_service_url'].rstrip('/')}/create_instance", "provider": instance, "webhook": webhook}
 
@@ -4996,6 +4999,7 @@ TWILIO_SID = os.environ.get("TWILIO_ACCOUNT_SID")
 TWILIO_TOKEN = os.environ.get("TWILIO_AUTH_TOKEN")
 TWILIO_FROM = os.environ.get("TWILIO_FROM_NUMBER")
 BACKEND_PUBLIC_URL = os.environ.get("BACKEND_PUBLIC_URL", "")
+WHATSAPP_WEBHOOK_URL = os.environ.get("WHATSAPP_WEBHOOK_URL", "").strip()
 
 _twilio_client: Optional[TwilioClient] = None
 _twilio_validator: Optional[RequestValidator] = None
