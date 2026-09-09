@@ -4076,7 +4076,9 @@ async def whatsapp_service_request(endpoint: str, settings: dict, params: Option
     url = f"{service_url}/{provider_endpoint.lstrip('/')}?{urllib.parse.urlencode(query)}"
 
     def _call() -> dict:
-        post_only = provider_endpoint in {"create_instance", "get_qrcode", "set_webhook", "reboot", "reset_instance", "reconnect", "send"}
+        # Marketly's live QR and webhook endpoints accept query-string GETs,
+        # even though the reference documentation labels them as POST.
+        post_only = provider_endpoint in {"create_instance", "reboot", "reset_instance", "reconnect", "send"}
         payload = None
         if data is not None or post_only:
             payload = dict(data or {})
@@ -4238,7 +4240,9 @@ async def whatsapp_connect(actor: dict = Depends(require_roles("admin"))):
     settings = await get_integration_settings()
     if not settings.get("whatsapp_service_url") or not settings.get("whatsapp_access_token"):
         return {"status": "pending_credentials", "message": "Configure WhatsApp service URL/access token before connecting"}
-    instance = await whatsapp_service_request("instance", settings)
+    instance = None
+    if not settings.get("whatsapp_instance_id"):
+        instance = await whatsapp_service_request("instance", settings)
     webhook = None
     webhook_url = WHATSAPP_WEBHOOK_URL or (
         f"{BACKEND_PUBLIC_URL.rstrip('/')}/api/whatsapp/webhook" if BACKEND_PUBLIC_URL else ""
@@ -4247,7 +4251,7 @@ async def whatsapp_connect(actor: dict = Depends(require_roles("admin"))):
         webhook = await whatsapp_service_request(
             "set_webhook",
             settings,
-            data={"webhook_url": webhook_url, "enable": True},
+            params={"webhook_url": webhook_url, "enable": "true"},
         )
     return {"status": "ready", "connect_url": f"{settings['whatsapp_service_url'].rstrip('/')}/create_instance", "provider": instance, "webhook": webhook}
 
