@@ -3919,6 +3919,20 @@ class CallerDeskCampaignPatchBody(BaseDoc):
     status: Optional[Literal["draft", "active", "paused", "completed", "cancelled"]] = None
 
 
+class MessageCampaignBody(BaseDoc):
+    name: str
+    channel: Literal["email", "sms", "whatsapp"]
+    message: str
+    subject: Optional[str] = None
+    lead_ids: Optional[List[str]] = None
+    call_status: Optional[str] = None
+
+
+class MessageCampaignPatchBody(BaseDoc):
+    name: Optional[str] = None
+    status: Optional[Literal["draft", "active", "paused", "completed", "cancelled"]] = None
+
+
 async def get_integration_settings() -> dict:
     return _with_env_integration_defaults(await db.settings.find_one({"id": "singleton"}, {"_id": 0}))
 
@@ -3952,6 +3966,134 @@ async def log_sms(lead_id: str, body: SmsLogBody, actor: dict = Depends(get_curr
 async def log_email(lead_id: str, body: EmailLogBody, actor: dict = Depends(get_current_user)):
     await require_lead_access(lead_id, actor)
     await log_activity(lead_id, actor, "email_sent", body.subject, body.model_dump())
+    return {"ok": True}
+
+
+async def _message_campaign_leads(body: MessageCampaignBody) -> list[dict]:
+    lead_ids = list(dict.fromkeys(body.lead_ids or []))
+    if body.call_status and body.call_status != "all":
+        status = _normalize_call_status(body.call_status)
+        matched_ids = await db.callerdesk_calls.distinct("lead_id", {"status": status})
+        matched_set = {x for x in matched_ids if x}
+        lead_ids = [lead_id for lead_id in lead_ids if lead_id in matched_set] if lead_ids else list(matched_set)
+    query = {"id": {"$in": lead_ids}} if lead_ids else {}
+    return await db.leads.find(query, {"_id": 0}).limit(1000).to_list(1000)
+
+
+def _message_campaign_recipient_status(channel: str, lead: dict) -> str:
+    if channel == "email" and not lead.get("email"):
+        return "failed"
+    if channel in {"sms", "whatsapp"} and not lead.get("phone"):
+        return "failed"
+    return "pending"
+
+
+@api.get("/message-campaigns")
+async def list_message_campaigns(user: dict = Depends(require_roles("admin", "manager"))):
+    campaigns = await db.message_campaigns.find({}, {"_id": 0}).sort("created_at", -1).limit(100).to_list(100)
+    for campaign in campaigns:
+        cid = campaign["id"]
+        campaign["total"] = await db.message_campaign_recipients.count_documents({"campaign_id": cid})
+        campaign["pending"] = await db.message_campaign_recipients.count_documents({"campaign_id": cid, "status": "pending"})
+        campaign["sent"] = await db.message_campaign_recipients.count_documents({"campaign_id": cid, "status": "sent"})
+        campaign["failed"] = await db.message_campaign_recipients.count_documents({"campaign_id": cid, "status": {"$in": ["failed", "pending_provider"]}})
+    return {"items": campaigns}
+
+
+@api.post("/message-campaigns")
+async def create_message_campaign(body: MessageCampaignBody, actor: dict = Depends(require_roles("admin", "manager"))):
+    if not body.message.strip():
+        raise HTTPException(status_code=400, detail="Campaign message is required")
+    if body.channel == "email" and not body.subject:
+        raise HTTPException(status_code=400, detail="Email subject is required")
+    leads = await _message_campaign_leads(body)
+    if not leads:
+        raise HTTPException(status_code=400, detail="Select at least one lead or call status")
+    now = now_utc().isoformat()
+    campaign = {
+        "id": new_id(),
+        "name": body.name.strip(),
+        "channel": body.channel,
+        "message": body.message.strip(),
+        "subject": (body.subject or "").strip(),
+        "call_status": body.call_status or "all",
+        "status": "draft",
+        "created_by": actor["id"],
+        "created_by_name": actor.get("name"),
+        "created_at": now,
+        "updated_at": now,
+    }
+    await db.message_campaigns.insert_one(campaign)
+    recipients = []
+    for lead in leads:
+        recipients.append({
+            "id": new_id(),
+            "campaign_id": campaign["id"],
+            "lead_id": lead["id"],
+            "lead_name": lead.get("name"),
+            "phone": lead.get("phone"),
+            "email": lead.get("email"),
+            "status": _message_campaign_recipient_status(body.channel, lead),
+            "created_at": now,
+            "updated_at": now,
+        })
+    await db.message_campaign_recipients.insert_many(recipients)
+    campaign.pop("_id", None)
+    campaign["total"] = len(recipients)
+    return campaign
+
+
+async def _deliver_message_campaign_item(campaign: dict, recipient: dict, actor: dict) -> str:
+    lead = await db.leads.find_one({"id": recipient["lead_id"]}, {"_id": 0})
+    if not lead:
+        return "failed"
+    channel = campaign["channel"]
+    if channel == "sms":
+        return "pending_provider"
+    if channel == "whatsapp":
+        result = await create_whatsapp_message_for_lead(lead, WhatsAppSendBody(text=campaign["message"]), actor)
+        return "sent" if result.get("provider", {}).get("status") not in {"pending_provider", "provider_error", "pending_credentials"} else "pending_provider"
+    if not resend or not resend.api_key:
+        return "pending_provider"
+    sender = (await get_integration_settings()).get("resend_from_email") or SENDER_EMAIL
+    await asyncio.to_thread(resend.Emails.send, {"from": sender, "to": [lead["email"]], "subject": campaign["subject"], "html": campaign["message"].replace("\n", "<br>")})
+    await log_activity(lead["id"], actor, "email_sent", campaign["subject"], {"campaign_id": campaign["id"]})
+    return "sent"
+
+
+@api.post("/message-campaigns/{campaign_id}/start")
+async def start_message_campaign(campaign_id: str, actor: dict = Depends(require_roles("admin", "manager"))):
+    campaign = await db.message_campaigns.find_one({"id": campaign_id}, {"_id": 0})
+    if not campaign:
+        raise HTTPException(status_code=404, detail="Campaign not found")
+    await db.message_campaigns.update_one({"id": campaign_id}, {"$set": {"status": "active", "updated_at": now_utc().isoformat()}})
+    recipients = await db.message_campaign_recipients.find({"campaign_id": campaign_id, "status": "pending"}).limit(1000).to_list(1000)
+    sent = failed = pending_provider = 0
+    for recipient in recipients:
+        try:
+            status_text = await _deliver_message_campaign_item(campaign, recipient, actor)
+        except Exception as exc:
+            status_text = "failed"
+            await db.message_campaign_recipients.update_one({"id": recipient["id"]}, {"$set": {"error": str(exc)}})
+        await db.message_campaign_recipients.update_one({"id": recipient["id"]}, {"$set": {"status": status_text, "updated_at": now_utc().isoformat()}})
+        if status_text == "sent": sent += 1
+        elif status_text == "pending_provider": pending_provider += 1
+        else: failed += 1
+    final_status = "completed" if not pending_provider else "completed_with_pending_provider"
+    await db.message_campaigns.update_one({"id": campaign_id}, {"$set": {"status": final_status, "updated_at": now_utc().isoformat()}})
+    return {"sent": sent, "failed": failed, "pending_provider": pending_provider, "status": final_status}
+
+
+@api.post("/message-campaigns/{campaign_id}/pause")
+async def pause_message_campaign(campaign_id: str, actor: dict = Depends(require_roles("admin", "manager"))):
+    await db.message_campaigns.update_one({"id": campaign_id}, {"$set": {"status": "paused", "updated_at": now_utc().isoformat()}})
+    return {"ok": True}
+
+
+@api.delete("/message-campaigns/{campaign_id}")
+async def delete_message_campaign(campaign_id: str, actor: dict = Depends(require_roles("admin", "manager"))):
+    await db.message_campaigns.update_one({"id": campaign_id}, {"$set": {"status": "cancelled", "updated_at": now_utc().isoformat()}})
+    await db.message_campaign_recipients.update_many({"campaign_id": campaign_id, "status": "pending"}, {"$set": {"status": "cancelled", "updated_at": now_utc().isoformat()}})
     return {"ok": True}
 
 
@@ -5077,17 +5219,45 @@ async def _callerdesk_api_request(method: str, endpoint: str, settings: dict, pa
 
 
 def _extract_callerdesk_sid(resp: dict) -> Optional[str]:
-    if not isinstance(resp, dict):
+    """Find the provider call identifier in any response nesting shape."""
+    sid_keys = {"sid_id", "call_sid", "callsid", "sid", "call_id", "callid", "provider_call_id"}
+
+    def walk(value):
+        if isinstance(value, dict):
+            for key, item in value.items():
+                if str(key).lower() in sid_keys and item not in (None, ""):
+                    return str(item)
+            for item in value.values():
+                found = walk(item)
+                if found:
+                    return found
+        elif isinstance(value, list):
+            for item in value:
+                found = walk(item)
+                if found:
+                    return found
         return None
-    candidates = [resp]
-    for key in ("data", "result", "response"):
-        if isinstance(resp.get(key), dict):
-            candidates.append(resp[key])
-    for item in candidates:
-        for key in ("sid_id", "call_sid", "CallSid", "sid", "id", "call_id"):
-            if item.get(key):
-                return str(item[key])
-    return None
+
+    return walk(resp)
+
+
+def _extract_callerdesk_value(resp: dict, keys: set[str], default=None):
+    if not isinstance(resp, (dict, list)):
+        return default
+    if isinstance(resp, dict):
+        for key, value in resp.items():
+            if str(key).lower() in keys and value not in (None, ""):
+                return value
+        for value in resp.values():
+            found = _extract_callerdesk_value(value, keys, None)
+            if found is not None:
+                return found
+    else:
+        for value in resp:
+            found = _extract_callerdesk_value(value, keys, None)
+            if found is not None:
+                return found
+    return default
 
 
 async def _save_callerdesk_call(
@@ -5203,7 +5373,7 @@ async def _initiate_callerdesk_call(
         raise HTTPException(status_code=400, detail=f"CallerDesk error: {e}")
 
     call_sid = _extract_callerdesk_sid(resp)
-    status_text = _normalize_call_status(resp.get("status") or resp.get("callstatus") or "initiated")
+    status_text = _normalize_call_status(_extract_callerdesk_value(resp, {"status", "callstatus", "call_status"}, "initiated"))
     call_id = await _save_callerdesk_call(
         lead,
         actor,
