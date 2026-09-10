@@ -4385,6 +4385,14 @@ async def whatsapp_connect(actor: dict = Depends(require_roles("admin"))):
     instance = None
     if not settings.get("whatsapp_instance_id"):
         instance = await whatsapp_service_request("instance", settings)
+        created_instance_id = _first_payload_value(instance, ["instance_id", "instanceId", "token", "id"])
+        if created_instance_id:
+            settings["whatsapp_instance_id"] = str(created_instance_id)
+            await db.settings.update_one(
+                {"id": "singleton"},
+                {"$set": {"whatsapp_instance_id": str(created_instance_id), "updated_at": now_utc().isoformat()}},
+                upsert=True,
+            )
     webhook = None
     webhook_url = WHATSAPP_WEBHOOK_URL or (
         f"{BACKEND_PUBLIC_URL.rstrip('/')}/api/whatsapp/webhook" if BACKEND_PUBLIC_URL else ""
@@ -4395,7 +4403,7 @@ async def whatsapp_connect(actor: dict = Depends(require_roles("admin"))):
             settings,
             params={"webhook_url": webhook_url, "enable": "true"},
         )
-    return {"status": "ready", "connect_url": f"{settings['whatsapp_service_url'].rstrip('/')}/create_instance", "provider": instance, "webhook": webhook}
+    return {"status": "ready", "instance_id": settings.get("whatsapp_instance_id"), "connect_url": f"{settings['whatsapp_service_url'].rstrip('/')}/create_instance", "provider": instance, "webhook": webhook}
 
 
 @api.get("/whatsapp/profile")
