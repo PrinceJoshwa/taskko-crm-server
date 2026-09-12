@@ -4122,6 +4122,10 @@ class WhatsAppBulkSendBody(BaseDoc):
     template_id: Optional[str] = None
 
 
+class WhatsAppPairingCodeBody(BaseDoc):
+    phone: str
+
+
 class WhatsAppRuleBody(BaseDoc):
     name: str
     keywords: Optional[str] = None
@@ -4190,19 +4194,46 @@ def _whatsapp_webhook_url() -> str:
 
 
 def _extract_whatsapp_phone(payload: dict) -> Optional[str]:
-    raw = _first_payload_value(payload, ["chat_id", "remoteJid", "jid", "from", "sender", "number", "phone", "contact_phone", "wa_id"])
+    raw = _first_payload_value(payload, [
+        "chat_id", "chatId", "remoteJid", "remote_jid", "jid", "from", "sender",
+        "author", "participant", "number", "phone", "contact_phone", "wa_id",
+    ])
     if not raw:
         return None
-    raw = str(raw).split("@", 1)[0]
+    raw = str(raw).split("@", 1)[0].split(":", 1)[0]
     digits = "".join(ch for ch in raw if ch.isdigit())
     return digits or None
 
 
 def _extract_whatsapp_text(payload: dict) -> str:
-    text = _first_payload_value(payload, ["text", "body", "message", "caption", "content"])
+    text = _first_payload_value(payload, [
+        "text", "conversation", "body", "messageText", "message_text", "caption", "content",
+    ])
     if text and not text.strip().startswith("{"):
         return text.strip()
     return "[WhatsApp message]"
+
+
+def _coerce_whatsapp_payload(payload):
+    """Unwrap Marketly/provider envelopes and JSON strings before extraction."""
+    current = payload
+    for _ in range(3):
+        if isinstance(current, str):
+            try:
+                decoded = json.loads(current)
+            except (TypeError, ValueError):
+                break
+            if decoded == current:
+                break
+            current = decoded
+            continue
+        if isinstance(current, dict):
+            nested = next((current[key] for key in ("data", "payload", "event_data") if key in current), None)
+            if isinstance(nested, (dict, list, str)) and (isinstance(nested, (dict, list)) or nested.strip().startswith(("{", "["))):
+                current = nested
+                continue
+        break
+    return current if isinstance(current, (dict, list)) else payload
 
 
 def _extract_whatsapp_message_id(payload: dict) -> Optional[str]:
@@ -4227,7 +4258,10 @@ async def whatsapp_service_request(endpoint: str, settings: dict, params: Option
     if not service_url or not access_token:
         return {"status": "pending_credentials", "message": "WhatsApp service URL/access token is not configured"}
     provider_endpoint = {
-        "instance": "create_instance",
+        # Marketly uses `instance` to report connection state.  It is not an
+        # alias for `create_instance`; the reference module keeps these flows
+        # separate so an existing account is never replaced accidentally.
+        "instance": "instance",
         "create_instance": "create_instance",
         "get_qrcode": "get_qrcode",
         "send_message": "send",
@@ -4236,6 +4270,7 @@ async def whatsapp_service_request(endpoint: str, settings: dict, params: Option
         "reboot": "reboot",
         "reset_instance": "reset_instance",
         "reconnect": "reconnect",
+        "get_pairing_code": "get_pairing_code",
         "set_webhook": "set_webhook",
         "get_info": "get_info",
     }.get(endpoint, endpoint)
@@ -4249,7 +4284,7 @@ async def whatsapp_service_request(endpoint: str, settings: dict, params: Option
     def _call() -> dict:
         # Marketly's live QR and webhook endpoints accept query-string GETs,
         # even though the reference documentation labels them as POST.
-        post_only = provider_endpoint in {"create_instance", "reboot", "reset_instance", "reconnect", "send"}
+        post_only = provider_endpoint in {"create_instance", "reboot", "reset_instance", "reconnect", "send", "get_pairing_code"}
         payload = None
         if data is not None or post_only:
             payload = dict(data or {})
@@ -4424,8 +4459,19 @@ async def whatsapp_connect(actor: dict = Depends(require_roles("admin"))):
     if not settings.get("whatsapp_service_url") or not settings.get("whatsapp_access_token"):
         return {"status": "pending_credentials", "message": "Configure WhatsApp service URL/access token before connecting"}
     instance = None
-    if not settings.get("whatsapp_instance_id"):
-        instance = await whatsapp_service_request("instance", settings)
+    current = await whatsapp_service_request("instance", settings) if settings.get("whatsapp_instance_id") else None
+    current_message = str((current or {}).get("message") or (current or {}).get("error") or "") if isinstance(current, dict) else ""
+    disconnected = isinstance(current, dict) and (
+        current.get("relogin") is True
+        or re.search(r"disconnected|invalid|expired|not found|used", current_message, re.I)
+    )
+    if not settings.get("whatsapp_instance_id") or disconnected:
+        # The reference module creates a new pending session only when the
+        # current instance cannot be reused.  Do not pass the stale ID to the
+        # create endpoint because Marketly expects only the access token there.
+        create_settings = dict(settings)
+        create_settings.pop("whatsapp_instance_id", None)
+        instance = await whatsapp_service_request("create_instance", create_settings)
         await _persist_whatsapp_instance(settings, instance)
     webhook = None
     webhook_url = _whatsapp_webhook_url()
@@ -4441,7 +4487,7 @@ async def whatsapp_connect(actor: dict = Depends(require_roles("admin"))):
 @api.get("/whatsapp/profile")
 async def whatsapp_profile(user: dict = Depends(require_roles("admin"))):
     settings = await get_integration_settings()
-    provider = await whatsapp_service_request("get_info", settings)
+    provider = await whatsapp_service_request("instance", settings)
     profile = {
         "provider": settings.get("whatsapp_provider") or "pending",
         "configured": bool(settings.get("whatsapp_service_url") and settings.get("whatsapp_access_token")),
@@ -4456,6 +4502,18 @@ async def whatsapp_profile(user: dict = Depends(require_roles("admin"))):
     return profile
 
 
+@api.post("/whatsapp/pairing-code")
+async def whatsapp_pairing_code(body: WhatsAppPairingCodeBody, actor: dict = Depends(require_roles("admin"))):
+    settings = await get_integration_settings()
+    if not body.phone.strip():
+        raise HTTPException(status_code=400, detail="Phone number is required")
+    return await whatsapp_service_request(
+        "get_pairing_code",
+        settings,
+        data={"phone": "".join(ch for ch in body.phone if ch.isdigit())},
+    )
+
+
 @api.get("/whatsapp/qrcode")
 async def whatsapp_qrcode(actor: dict = Depends(require_roles("admin"))):
     settings = await get_integration_settings()
@@ -4465,7 +4523,9 @@ async def whatsapp_qrcode(actor: dict = Depends(require_roles("admin"))):
         # Marketly requires a new instance for a fresh WhatsApp Web scan.
         # Create it only after the configured instance is rejected, then retry
         # the documented QR endpoint with the new ID.
-        fresh_instance = await whatsapp_service_request("instance", settings)
+        create_settings = dict(settings)
+        create_settings.pop("whatsapp_instance_id", None)
+        fresh_instance = await whatsapp_service_request("create_instance", create_settings)
         if await _persist_whatsapp_instance(settings, fresh_instance):
             webhook_url = _whatsapp_webhook_url()
             if webhook_url:
@@ -4475,6 +4535,11 @@ async def whatsapp_qrcode(actor: dict = Depends(require_roles("admin"))):
                     params={"webhook_url": webhook_url, "enable": "true"},
                 )
             result = await whatsapp_service_request("get_qrcode", settings)
+    if isinstance(result, dict):
+        # Marketly's profile page returns the QR as `base64`; Taskko's UI also
+        # accepts `qrcode`/`qr_code`, so normalize the common provider shape.
+        if result.get("base64") and not result.get("qrcode"):
+            result["qrcode"] = result["base64"]
     return result
 
 
@@ -4675,6 +4740,7 @@ async def whatsapp_webhook(request: Request):
         payload = await request.json()
     else:
         payload = dict(await request.form())
+    payload = _coerce_whatsapp_payload(payload)
 
     from_me = str(_first_payload_value(payload, ["fromMe", "from_me", "is_from_me"]) or "").lower()
     direction_hint = str(_first_payload_value(payload, ["direction", "event", "type"]) or "").lower()
@@ -4684,6 +4750,7 @@ async def whatsapp_webhook(request: Request):
 
     phone_digits = _extract_whatsapp_phone(payload)
     if not phone_digits:
+        log.warning("WhatsApp webhook payload did not contain a sender phone; keys=%s", list(payload.keys()) if isinstance(payload, dict) else type(payload).__name__)
         return {"ok": False, "detail": "No WhatsApp sender phone found"}
     chat_id = whatsapp_chat_id(phone_digits)
     text = _extract_whatsapp_text(payload)
