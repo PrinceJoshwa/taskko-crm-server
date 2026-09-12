@@ -2687,6 +2687,7 @@ ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / ".env")
 
 import os
+import re
 import logging
 import secrets
 import uuid
@@ -2695,6 +2696,7 @@ import asyncio
 import json
 import urllib.parse
 import urllib.request
+import urllib.error
 from datetime import datetime, timezone, timedelta
 from typing import Optional, List, Literal
 
@@ -4160,6 +4162,33 @@ def _first_payload_value(payload, keys: list[str]) -> Optional[str]:
     return None
 
 
+async def _persist_whatsapp_instance(settings: dict, instance: dict) -> Optional[str]:
+    instance_id = _first_payload_value(instance, ["instance_id", "instanceId", "token", "id"])
+    if not instance_id:
+        return None
+    instance_id = str(instance_id)
+    settings["whatsapp_instance_id"] = instance_id
+    await db.settings.update_one(
+        {"id": "singleton"},
+        {"$set": {"whatsapp_instance_id": instance_id, "updated_at": now_utc().isoformat()}},
+        upsert=True,
+    )
+    return instance_id
+
+
+def _whatsapp_webhook_url() -> str:
+    configured = WHATSAPP_WEBHOOK_URL.strip()
+    if configured.startswith("https://"):
+        return configured.rstrip("/")
+    if BACKEND_PUBLIC_URL.startswith("https://"):
+        return f"{BACKEND_PUBLIC_URL.rstrip('/')}/api/whatsapp/webhook"
+    # Vercel may not expose BACKEND_PUBLIC_URL in every environment, but this
+    # is the stable production alias registered with the WhatsApp provider.
+    if os.environ.get("VERCEL"):
+        return "https://taskko-crm-server.vercel.app/api/whatsapp/webhook"
+    return f"{BACKEND_PUBLIC_URL.rstrip('/')}/api/whatsapp/webhook" if BACKEND_PUBLIC_URL else ""
+
+
 def _extract_whatsapp_phone(payload: dict) -> Optional[str]:
     raw = _first_payload_value(payload, ["chat_id", "remoteJid", "jid", "from", "sender", "number", "phone", "contact_phone", "wa_id"])
     if not raw:
@@ -4242,6 +4271,18 @@ async def whatsapp_service_request(endpoint: str, settings: dict, params: Option
 
     try:
         return await asyncio.to_thread(_call)
+    except urllib.error.HTTPError as exc:
+        try:
+            raw = exc.read().decode("utf-8")
+            provider_error = json.loads(raw) if raw else {}
+        except Exception:
+            provider_error = {}
+        if not isinstance(provider_error, dict):
+            provider_error = {}
+        provider_error.setdefault("status", "provider_error")
+        provider_error.setdefault("message", f"WhatsApp provider returned HTTP {exc.code}")
+        log.warning("WhatsApp service request failed for %s: %s", endpoint, provider_error.get("message"))
+        return provider_error
     except Exception as exc:
         log.warning("WhatsApp service request failed for %s: %s", endpoint, exc)
         return {"status": "provider_error", "message": str(exc)}
@@ -4385,18 +4426,9 @@ async def whatsapp_connect(actor: dict = Depends(require_roles("admin"))):
     instance = None
     if not settings.get("whatsapp_instance_id"):
         instance = await whatsapp_service_request("instance", settings)
-        created_instance_id = _first_payload_value(instance, ["instance_id", "instanceId", "token", "id"])
-        if created_instance_id:
-            settings["whatsapp_instance_id"] = str(created_instance_id)
-            await db.settings.update_one(
-                {"id": "singleton"},
-                {"$set": {"whatsapp_instance_id": str(created_instance_id), "updated_at": now_utc().isoformat()}},
-                upsert=True,
-            )
+        await _persist_whatsapp_instance(settings, instance)
     webhook = None
-    webhook_url = WHATSAPP_WEBHOOK_URL or (
-        f"{BACKEND_PUBLIC_URL.rstrip('/')}/api/whatsapp/webhook" if BACKEND_PUBLIC_URL else ""
-    )
+    webhook_url = _whatsapp_webhook_url()
     if webhook_url:
         webhook = await whatsapp_service_request(
             "set_webhook",
@@ -4427,7 +4459,23 @@ async def whatsapp_profile(user: dict = Depends(require_roles("admin"))):
 @api.get("/whatsapp/qrcode")
 async def whatsapp_qrcode(actor: dict = Depends(require_roles("admin"))):
     settings = await get_integration_settings()
-    return await whatsapp_service_request("get_qrcode", settings)
+    result = await whatsapp_service_request("get_qrcode", settings)
+    message = str(result.get("message") or result.get("error") or "") if isinstance(result, dict) else ""
+    if re.search(r"instance.?id.*(used|expired|invalid)|already connected|not found", message, re.I):
+        # Marketly requires a new instance for a fresh WhatsApp Web scan.
+        # Create it only after the configured instance is rejected, then retry
+        # the documented QR endpoint with the new ID.
+        fresh_instance = await whatsapp_service_request("instance", settings)
+        if await _persist_whatsapp_instance(settings, fresh_instance):
+            webhook_url = _whatsapp_webhook_url()
+            if webhook_url:
+                await whatsapp_service_request(
+                    "set_webhook",
+                    settings,
+                    params={"webhook_url": webhook_url, "enable": "true"},
+                )
+            result = await whatsapp_service_request("get_qrcode", settings)
+    return result
 
 
 @api.post("/whatsapp/disconnect")
