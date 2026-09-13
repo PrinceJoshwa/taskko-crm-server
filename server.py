@@ -3103,6 +3103,9 @@ class SettingsBody(BaseDoc):
     whatsapp_service_url: Optional[str] = None
     whatsapp_access_token: Optional[str] = None
     whatsapp_instance_id: Optional[str] = None
+    marketly_api_base_url: Optional[str] = None
+    marketly_bearer_token: Optional[str] = None
+    marketly_instance_id: Optional[str] = None
     callerdesk_base_url: Optional[str] = None
     callerdesk_authcode: Optional[str] = None
     callerdesk_virtual_number: Optional[str] = None
@@ -3819,6 +3822,9 @@ def _env_integration_defaults() -> dict:
         "whatsapp_access_token": os.environ.get("WHATSAPP_ACCESS_TOKEN", "").strip(),
         "whatsapp_instance_id": os.environ.get("WHATSAPP_INSTANCE_ID", "").strip(),
         "whatsapp_number": os.environ.get("WHATSAPP_NUMBER", "").strip(),
+        "marketly_api_base_url": os.environ.get("MARKETLY_API_BASE_URL", "https://software.marketly.tech/api/v2").strip(),
+        "marketly_bearer_token": os.environ.get("MARKETLY_BEARER_TOKEN", "").strip(),
+        "marketly_instance_id": os.environ.get("MARKETLY_INSTANCE_ID", "").strip(),
         "callerdesk_base_url": os.environ.get("CALLERDESK_BASE_URL", "").strip(),
         "callerdesk_authcode": os.environ.get("CALLERDESK_AUTHCODE", "").strip(),
         "callerdesk_virtual_number": os.environ.get("CALLERDESK_VIRTUAL_NUMBER", "").strip(),
@@ -4116,6 +4122,14 @@ class WhatsAppDirectSendBody(BaseDoc):
     template_id: Optional[str] = None
 
 
+class WhatsAppMediaSendBody(BaseDoc):
+    lead_id: str
+    media_type: Literal["image", "document", "audio", "video"]
+    media_url: str
+    caption: Optional[str] = None
+    filename: Optional[str] = None
+
+
 class WhatsAppBulkSendBody(BaseDoc):
     lead_ids: List[str]
     text: str
@@ -4240,6 +4254,19 @@ def _extract_whatsapp_message_id(payload: dict) -> Optional[str]:
     return _first_payload_value(payload, ["message_id", "messageId", "wamid", "id"])
 
 
+def _extract_whatsapp_timestamp(payload: dict) -> str:
+    value = _first_payload_value(payload, ["timestamp", "message_timestamp", "messageTimestamp", "sent_at", "sentAt", "time"])
+    if not value:
+        return now_utc().isoformat()
+    try:
+        numeric = float(value)
+        if numeric > 10_000_000_000:
+            numeric /= 1000
+        return datetime.fromtimestamp(numeric, timezone.utc).isoformat()
+    except (TypeError, ValueError, OverflowError):
+        return str(value)
+
+
 async def _find_lead_by_phone_digits(phone_digits: str) -> Optional[dict]:
     if not phone_digits:
         return None
@@ -4360,8 +4387,62 @@ async def ensure_whatsapp_conversation_for_lead(lead: dict, actor: dict) -> dict
     return doc
 
 
+async def marketly_v2_request(kind: str, settings: dict, payload: dict) -> dict:
+    """Call Marketly's documented v2 Bearer API without a WhatsApp SDK."""
+    base_url = (settings.get("marketly_api_base_url") or "https://software.marketly.tech/api/v2").rstrip("/")
+    token = settings.get("marketly_bearer_token")
+    endpoint = {
+        "text": "whatsapp/send/text",
+        "image": "whatsapp/send/image",
+        "document": "whatsapp/send/document",
+        "audio": "whatsapp/send/audio",
+        "video": "whatsapp/send/video",
+    }.get(kind)
+    if not token or not endpoint:
+        return {"status": "pending_credentials", "message": "Marketly v2 credentials are not configured"}
+
+    def _call() -> dict:
+        req = urllib.request.Request(
+            f"{base_url}/{endpoint}",
+            data=json.dumps(payload).encode("utf-8"),
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "application/json",
+                "Accept": "application/json",
+            },
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=25) as resp:
+            raw = resp.read().decode("utf-8", errors="replace")
+        try:
+            return json.loads(raw) if raw else {"status": "success"}
+        except json.JSONDecodeError:
+            return {"status": "success", "raw": raw}
+
+    try:
+        return await asyncio.to_thread(_call)
+    except urllib.error.HTTPError as exc:
+        raw = exc.read().decode("utf-8", errors="replace")
+        try:
+            detail = json.loads(raw)
+        except json.JSONDecodeError:
+            detail = {"raw": raw}
+        return {"status": "provider_error", "http_status": exc.code, "message": "Marketly v2 request failed", "provider_response": detail}
+    except Exception as exc:
+        log.warning("Marketly v2 request failed for %s: %s", kind, exc)
+        return {"status": "provider_error", "message": str(exc)}
+
+
 async def forward_whatsapp_message(settings: dict, lead: dict, conversation: dict, text: str) -> dict:
     number = "".join(ch for ch in str(lead.get("phone") or conversation.get("contact_phone") or "") if ch.isdigit())
+    bearer = settings.get("marketly_bearer_token")
+    marketly_instance = settings.get("marketly_instance_id") or settings.get("whatsapp_instance_id")
+    if bearer and marketly_instance:
+        return await marketly_v2_request(
+            "text",
+            settings,
+            {"instance_id": marketly_instance, "to": number, "message": text},
+        )
     result = await whatsapp_service_request(
         "send",
         settings,
@@ -4374,7 +4455,7 @@ async def forward_whatsapp_message(settings: dict, lead: dict, conversation: dic
 
 async def create_whatsapp_message_for_lead(lead: dict, body: WhatsAppSendBody, actor: dict) -> dict:
     conv = await ensure_whatsapp_conversation_for_lead(lead, actor)
-    now = now_utc().isoformat()
+    now = _extract_whatsapp_timestamp(payload)
     provider_result = await forward_whatsapp_message(await get_integration_settings(), lead, conv, body.text)
     msg = {
         "id": new_id(),
@@ -4678,6 +4759,35 @@ async def send_whatsapp_message(body: WhatsAppDirectSendBody, actor: dict = Depe
     return await create_whatsapp_message_for_lead(lead, WhatsAppSendBody(text=body.text, template_id=body.template_id), actor)
 
 
+@api.post("/whatsapp/media")
+async def send_whatsapp_media(body: WhatsAppMediaSendBody, actor: dict = Depends(require_roles("admin"))):
+    lead = await db.leads.find_one({"id": body.lead_id}, {"_id": 0})
+    if not lead:
+        raise HTTPException(status_code=404, detail="Lead not found")
+    conv = await ensure_whatsapp_conversation_for_lead(lead, actor)
+    settings = await get_integration_settings()
+    number = "".join(ch for ch in str(lead.get("phone") or conv.get("contact_phone") or "") if ch.isdigit())
+    instance_id = settings.get("marketly_instance_id") or settings.get("whatsapp_instance_id")
+    payload = {"instance_id": instance_id, "to": number, "media_url": body.media_url}
+    if body.caption and body.media_type == "image":
+        payload["caption"] = body.caption
+    provider = await marketly_v2_request(body.media_type, settings, payload) if settings.get("marketly_bearer_token") else await whatsapp_service_request(
+        "send", settings, data={"number": number, "type": "media", "message": body.caption or "", "media_url": body.media_url, "filename": body.filename}
+    )
+    now = now_utc().isoformat()
+    msg = {
+        "id": new_id(), "conversation_id": conv["id"], "lead_id": lead["id"],
+        "direction": "outgoing", "sender_id": actor.get("id"), "sender_name": actor.get("name"),
+        "message_type": body.media_type, "text": body.caption or "", "media_url": body.media_url,
+        "filename": body.filename, "provider_status": provider.get("status"),
+        "provider_response": provider, "created_at": now,
+    }
+    await db.whatsapp_messages.insert_one(msg)
+    await db.whatsapp_conversations.update_one({"id": conv["id"]}, {"$set": {"last_message": body.caption or f"[{body.media_type}]", "last_message_at": now, "updated_at": now}})
+    clean(msg)
+    return {"ok": True, "message": msg, "provider": provider, "conversation_id": conv["id"]}
+
+
 @api.post("/whatsapp/bulk-send")
 async def bulk_send_whatsapp(body: WhatsAppBulkSendBody, actor: dict = Depends(require_roles("admin"))):
     if not body.lead_ids:
@@ -4731,6 +4841,7 @@ async def whatsapp_messages(conversation_id: str, user: dict = Depends(require_r
     return await db.whatsapp_messages.find({"conversation_id": conversation_id}, {"_id": 0}).sort("created_at", 1).to_list(500)
 
 
+@app.api_route("/webhook/whatsapp/inbound", methods=["POST"])
 @api.api_route("/whatsapp/webhook", methods=["GET", "POST"])
 async def whatsapp_webhook(request: Request):
     if request.method == "GET":
@@ -5218,6 +5329,157 @@ async def dashboard_action_items(user: dict = Depends(get_current_user)):
 # ---------------------------------------------------------------------------
 # REPORTS (aggregations)
 # ---------------------------------------------------------------------------
+def _report_date(value: Optional[str], fallback: datetime) -> datetime:
+    if not value:
+        return fallback
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+    except ValueError:
+        return fallback
+
+
+async def _report_context(
+    start: Optional[str],
+    end: Optional[str],
+    date_field: str,
+    user: dict,
+    stage: Optional[str] = None,
+    source: Optional[str] = None,
+    assigned_to: Optional[str] = None,
+):
+    end_dt = _report_date(end, now_utc())
+    if end and len(end) == 10:
+        end_dt = end_dt + timedelta(days=1) - timedelta(microseconds=1)
+    start_dt = _report_date(start, end_dt - timedelta(days=30))
+    field = "updated_at" if date_field == "updated" else "created_at"
+    match = {field: {"$gte": start_dt.isoformat(), "$lte": end_dt.isoformat()}}
+    if stage and stage != "all":
+        match["stage"] = stage
+    if source and source != "all":
+        match["source"] = source
+    if assigned_to and assigned_to != "all":
+        match["assigned_to"] = assigned_to
+    if user.get("role") in {"executive", "sales"}:
+        match["assigned_to"] = user["id"]
+    return start_dt, end_dt, match
+
+
+def _activity_metric(rows: list[dict], kind: str, direction: Optional[str] = None) -> int:
+    return sum(1 for row in rows if row.get("kind") == kind and (not direction or row.get("meta", {}).get("direction") == direction or row.get("direction") == direction))
+
+
+@api.get("/reports/summary")
+async def report_summary(
+    start: Optional[str] = None,
+    end: Optional[str] = None,
+    date_field: str = "created",
+    stage: Optional[str] = None,
+    source: Optional[str] = None,
+    assigned_to: Optional[str] = None,
+    user: dict = Depends(get_current_user),
+):
+    start_dt, end_dt, lead_match = await _report_context(start, end, date_field, user, stage, source, assigned_to)
+    activity_match = {"created_at": {"$gte": start_dt.isoformat(), "$lte": end_dt.isoformat()}}
+    if user.get("role") in {"executive", "sales"}:
+        activity_match["actor_id"] = user["id"]
+    leads, activities, followups = await asyncio.gather(
+        db.leads.find(lead_match, {"_id": 0}).to_list(5000),
+        db.activities.find(activity_match, {"_id": 0}).to_list(10000),
+        db.follow_ups.find({"created_at": activity_match["created_at"], "status": {"$in": ["pending", "completed", "dismissed"]}}, {"_id": 0}).to_list(5000),
+    )
+    outgoing_calls = [a for a in activities if a.get("kind") in {"outgoing_call", "call", "missed_call"} and a.get("meta", {}).get("direction", "outgoing") == "outgoing"]
+    incoming_calls = [a for a in activities if a.get("kind") == "incoming_call" or a.get("meta", {}).get("direction") == "incoming"]
+    sms = [a for a in activities if a.get("kind") in {"sms", "sms_sent"}]
+    email = [a for a in activities if a.get("kind") in {"email", "email_sent"}]
+    def unique_leads(rows):
+        return len({r.get("lead_id") for r in rows if r.get("lead_id")})
+    return {
+        "period": {"start": start_dt.isoformat(), "end": end_dt.isoformat(), "date_field": date_field},
+        "totals": {"leads": len(leads), "booked": sum(1 for l in leads if l.get("stage") == "booked"), "site_visits": sum(1 for l in leads if l.get("stage") == "site_visit"), "stars": sum(1 for l in leads if (l.get("stars") or 0) > 0)},
+        "activity": {
+            "outgoing_calls": len(outgoing_calls), "outgoing_answered": sum(1 for a in outgoing_calls if a.get("meta", {}).get("disposition") in {"connected", "answered"}),
+            "outgoing_missed": sum(1 for a in outgoing_calls if a.get("kind") == "missed_call" or a.get("meta", {}).get("disposition") in {"missed", "no_answer", "busy"}),
+            "unique_outgoing": unique_leads(outgoing_calls), "incoming_calls": len(incoming_calls), "incoming_answered": sum(1 for a in incoming_calls if a.get("meta", {}).get("disposition") in {"connected", "answered"}),
+            "sms_sent": len(sms), "emails_sent": len(email), "followups": len(followups), "followups_dismissed": sum(1 for f in followups if f.get("status") == "dismissed"),
+        },
+        "by_stage": [{"stage": s, "count": sum(1 for l in leads if l.get("stage") == s)} for s in ["new", "contacted", "qualified", "site_visit", "negotiation", "booked", "lost"]],
+    }
+
+
+@api.get("/reports/activity")
+async def report_activity(start: Optional[str] = None, end: Optional[str] = None, date_field: str = "created", assigned_to: Optional[str] = None, user: dict = Depends(get_current_user)):
+    start_dt, end_dt, lead_match = await _report_context(start, end, date_field, user, assigned_to=assigned_to)
+    rows = await db.activities.find({"created_at": {"$gte": start_dt.isoformat(), "$lte": end_dt.isoformat()}}, {"_id": 0}).to_list(20000)
+    if "assigned_to" in lead_match:
+        scoped = await db.leads.find(lead_match, {"_id": 0, "id": 1}).to_list(20000)
+        allowed = {lead["id"] for lead in scoped}
+        rows = [row for row in rows if row.get("lead_id") in allowed]
+    users = {u["id"]: u.get("name", u["id"]) for u in await db.users.find({}, {"_id": 0, "id": 1, "name": 1}).to_list(500)}
+    lead_ids = list({r.get("lead_id") for r in rows if r.get("lead_id")})
+    leads = {l["id"]: l for l in await db.leads.find({"id": {"$in": lead_ids}}, {"_id": 0}).to_list(len(lead_ids) or 1)}
+    grouped = {}
+    for row in rows:
+        actor = row.get("actor_id") or row.get("user_id") or "unassigned"
+        item = grouped.setdefault(actor, {"user_id": actor, "user": users.get(actor, row.get("actor_name", "Unassigned")), "outgoing_calls": 0, "answered": 0, "missed": 0, "unique_contacts": set(), "sms_sent": 0, "emails_sent": 0, "followups": 0, "total_duration_sec": 0})
+        kind = row.get("kind", "")
+        meta = row.get("meta") or {}
+        if kind in {"outgoing_call", "call", "missed_call"} and meta.get("direction", "outgoing") == "outgoing":
+            item["outgoing_calls"] += 1; item["total_duration_sec"] += int(meta.get("duration_sec") or 0); item["unique_contacts"].add(row.get("lead_id"))
+            if meta.get("disposition") in {"connected", "answered"}: item["answered"] += 1
+            if kind == "missed_call" or meta.get("disposition") in {"missed", "no_answer", "busy"}: item["missed"] += 1
+        if kind in {"sms", "sms_sent"}: item["sms_sent"] += 1
+        if kind in {"email", "email_sent"}: item["emails_sent"] += 1
+        if kind == "followup_scheduled": item["followups"] += 1
+    out = []
+    for item in grouped.values():
+        item["unique_contacts"] = len({x for x in item["unique_contacts"] if x})
+        item["avg_duration_sec"] = round(item["total_duration_sec"] / item["outgoing_calls"], 1) if item["outgoing_calls"] else 0
+        out.append(item)
+    return sorted(out, key=lambda x: (-x["outgoing_calls"], x["user"]))
+
+
+@api.get("/reports/daily")
+async def report_daily(start: Optional[str] = None, end: Optional[str] = None, user: dict = Depends(get_current_user)):
+    start_dt, end_dt, _ = await _report_context(start, end, "created", user)
+    rows = await db.activities.find({"created_at": {"$gte": start_dt.isoformat(), "$lte": end_dt.isoformat()}}, {"_id": 0}).to_list(20000)
+    buckets = {}
+    cursor = start_dt.date()
+    while cursor <= end_dt.date():
+        buckets[cursor.isoformat()] = {"date": cursor.isoformat(), "email_sent": 0, "followups": 0, "outgoing_calls": 0, "sms_sent": 0}
+        cursor += timedelta(days=1)
+    for row in rows:
+        key = str(row.get("created_at", ""))[:10]
+        if key not in buckets: continue
+        kind = row.get("kind", "")
+        if kind in {"email", "email_sent"}: buckets[key]["email_sent"] += 1
+        elif kind == "followup_scheduled": buckets[key]["followups"] += 1
+        elif kind in {"outgoing_call", "call", "missed_call"}: buckets[key]["outgoing_calls"] += 1
+        elif kind in {"sms", "sms_sent"}: buckets[key]["sms_sent"] += 1
+    return list(buckets.values())
+
+
+@api.get("/reports/user-status")
+async def report_user_status(start: Optional[str] = None, end: Optional[str] = None, date_field: str = "created", user: dict = Depends(get_current_user)):
+    _, _, match = await _report_context(start, end, date_field, user)
+    leads = await db.leads.find(match, {"_id": 0}).to_list(20000)
+    users = {u["id"]: u.get("name", u["id"]) for u in await db.users.find({}, {"_id": 0, "id": 1, "name": 1}).to_list(500)}
+    stages = ["new", "contacted", "qualified", "site_visit", "negotiation", "booked", "lost"]
+    grouped = {}
+    for lead in leads:
+        uid = lead.get("assigned_to") or "unassigned"
+        grouped.setdefault(uid, {"user_id": uid, "user": users.get(uid, "Unassigned"), **{s: 0 for s in stages}})[lead.get("stage", "new")] += 1
+    return list(grouped.values())
+
+
+@api.get("/reports/not-interested")
+async def report_not_interested(start: Optional[str] = None, end: Optional[str] = None, date_field: str = "updated", user: dict = Depends(get_current_user)):
+    _, _, match = await _report_context(start, end, date_field, user)
+    match["$or"] = [{"stage": "lost"}, {"lost_reason": {"$exists": True}}]
+    rows = await db.leads.find(match, {"_id": 0}).sort("updated_at", -1).to_list(20000)
+    return [{"id": l.get("id"), "name": l.get("name"), "phone": l.get("phone"), "source": l.get("source"), "stage": l.get("stage"), "reason": l.get("lost_reason") or l.get("reason") or "Not interested", "updated_at": l.get("updated_at"), "assigned_to": l.get("assigned_to")} for l in rows]
+
+
 @api.get("/reports/executives")
 async def report_executives(user: dict = Depends(get_current_user)):
     execs = await db.users.find({"role": "executive"}, {"_id": 0, "password_hash": 0}).to_list(100)
