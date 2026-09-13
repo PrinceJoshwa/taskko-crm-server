@@ -4455,7 +4455,7 @@ async def forward_whatsapp_message(settings: dict, lead: dict, conversation: dic
 
 async def create_whatsapp_message_for_lead(lead: dict, body: WhatsAppSendBody, actor: dict) -> dict:
     conv = await ensure_whatsapp_conversation_for_lead(lead, actor)
-    now = _extract_whatsapp_timestamp(payload)
+    now = now_utc().isoformat()
     provider_result = await forward_whatsapp_message(await get_integration_settings(), lead, conv, body.text)
     msg = {
         "id": new_id(),
