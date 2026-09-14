@@ -2915,6 +2915,8 @@ async def can_access_lead(lead: dict, user: dict) -> bool:
         return True
     if lead.get("assigned_to") == user.get("id"):
         return True
+    if user.get("id") in (lead.get("co_assigned_to") or []):
+        return True
     visit = await db.site_visits.find_one({
         "lead_id": lead.get("id"),
         "$or": [
@@ -2939,7 +2941,7 @@ async def require_lead_access(lead_id: str, user: dict) -> dict:
 # Models (pydantic schemas for requests / responses)
 # ---------------------------------------------------------------------------
 Role = Literal["admin", "manager", "executive", "sales"]
-LeadStage = Literal["new", "contacted", "qualified", "site_visit", "negotiation", "booked", "lost"]
+LeadStage = Literal["new", "contacted", "contacted_dnp", "qualified", "qualified_dnp", "site_visit", "site_visit_dnp", "negotiation", "negotiation_dnp", "booked", "lost"]
 LeadSource = Literal["magicbricks", "99acres", "commonfloor", "housing", "website", "jagathi_website", "google_ads", "facebook", "instagram", "referral", "walk_in", "manual"]
 UnitStatus = Literal["available", "held", "booked", "sold"]
 VisitStatus = Literal["scheduled", "completed", "no_show", "cancelled"]
@@ -3011,6 +3013,7 @@ class LeadBody(BaseDoc):
     location_pref: Optional[str] = None
     notes: Optional[str] = None
     assigned_to: Optional[str] = None
+    co_assigned_to: Optional[List[str]] = None
     stage: LeadStage = "new"
     stars: Optional[int] = 0
 
@@ -3030,6 +3033,7 @@ class UpdateLeadBody(BaseDoc):
     location_pref: Optional[str] = None
     notes: Optional[str] = None
     assigned_to: Optional[str] = None
+    co_assigned_to: Optional[List[str]] = None
     stage: Optional[LeadStage] = None
     lost_reason: Optional[str] = None
     priority: Optional[Literal["hot", "warm", "cold"]] = None
@@ -3038,6 +3042,10 @@ class UpdateLeadBody(BaseDoc):
 
 class AssignBody(BaseDoc):
     user_id: str
+
+
+class CoAssignBody(BaseDoc):
+    user_ids: List[str] = []
 
 
 class StageBody(BaseDoc):
@@ -3057,6 +3065,7 @@ class SiteVisitBody(BaseDoc):
     presales_owner_id: Optional[str] = None
     sales_owner_id: Optional[str] = None
     assigned_to: Optional[str] = None
+    co_assigned_to: Optional[List[str]] = None
     notes: Optional[str] = None
 
 
@@ -3427,7 +3436,7 @@ async def create_lead(body: LeadBody, actor: dict = Depends(require_roles("admin
 
 
 @api.patch("/leads/{lead_id}")
-async def update_lead(lead_id: str, body: UpdateLeadBody, actor: dict = Depends(require_roles("admin"))):
+async def update_lead(lead_id: str, body: UpdateLeadBody, actor: dict = Depends(require_roles("admin", "manager"))):
     lead = await db.leads.find_one({"id": lead_id})
     if not lead:
         raise HTTPException(status_code=404, detail="Lead not found")
@@ -3446,7 +3455,7 @@ async def update_lead(lead_id: str, body: UpdateLeadBody, actor: dict = Depends(
 
 
 @api.post("/leads/{lead_id}/assign")
-async def assign_lead(lead_id: str, body: AssignBody, actor: dict = Depends(require_roles("admin"))):
+async def assign_lead(lead_id: str, body: AssignBody, actor: dict = Depends(require_roles("admin", "manager"))):
     r = await db.leads.update_one(
         {"id": lead_id},
         {"$set": {"assigned_to": body.user_id, "updated_at": now_utc().isoformat()}},
@@ -3468,9 +3477,23 @@ async def assign_lead(lead_id: str, body: AssignBody, actor: dict = Depends(requ
     return sanitize_phone_fields(lead, actor)
 
 
+@api.post("/leads/{lead_id}/co-assign")
+async def co_assign_lead(lead_id: str, body: CoAssignBody, actor: dict = Depends(require_roles("admin", "manager"))):
+    lead = await db.leads.find_one({"id": lead_id})
+    if not lead:
+        raise HTTPException(status_code=404, detail="Lead not found")
+    users = await db.users.find({"id": {"$in": body.user_ids}, "active": {"$ne": False}}, {"_id": 0, "id": 1, "name": 1}).to_list(100)
+    ids = [u["id"] for u in users]
+    await db.leads.update_one({"id": lead_id}, {"$set": {"co_assigned_to": ids, "updated_at": now_utc().isoformat()}})
+    await log_activity(lead_id, actor, "assignment", f"Co-assignees updated: {len(ids)}")
+    return sanitize_phone_fields(await db.leads.find_one({"id": lead_id}, {"_id": 0}), actor)
+
+
 @api.post("/leads/{lead_id}/stage")
-async def move_stage(lead_id: str, body: StageBody, actor: dict = Depends(require_roles("admin"))):
+async def move_stage(lead_id: str, body: StageBody, actor: dict = Depends(require_roles("admin", "manager"))):
     update = {"stage": body.stage, "updated_at": now_utc().isoformat()}
+    if body.stage == "lost" and body.note:
+        update["lost_reason"] = body.note
     r = await db.leads.update_one({"id": lead_id}, {"$set": update})
     if r.matched_count == 0:
         raise HTTPException(status_code=404, detail="Lead not found")
@@ -3674,12 +3697,18 @@ async def delete_visit(visit_id: str, actor: dict = Depends(require_roles("admin
 # FOLLOW-UPS
 # ---------------------------------------------------------------------------
 @api.get("/follow-ups")
-async def list_followups(lead_id: Optional[str] = None, status_q: Optional[str] = Query(None, alias="status"), user: dict = Depends(get_current_user)):
+async def list_followups(lead_id: Optional[str] = None, status_q: Optional[str] = Query(None, alias="status"), date_from: Optional[str] = None, date_to: Optional[str] = None, user: dict = Depends(get_current_user)):
     q: dict = {}
     if lead_id:
         q["lead_id"] = lead_id
     if status_q:
         q["status"] = status_q
+    if date_from or date_to:
+        q["due_at"] = {}
+        if date_from:
+            q["due_at"]["$gte"] = date_from
+        if date_to:
+            q["due_at"]["$lte"] = f"{date_to}T23:59:59.999999+00:00" if len(date_to) == 10 else date_to
     if user["role"] in {"executive", "sales"}:
         q["assigned_to"] = user["id"]
     docs = await db.follow_ups.find(q, {"_id": 0}).sort("due_at", 1).to_list(2000)
@@ -5170,14 +5199,17 @@ def _month_bounds(dt: datetime) -> tuple:
 
 
 @api.get("/dashboard/monthly")
-async def dashboard_monthly(user: dict = Depends(get_current_user)):
+async def dashboard_monthly(date_from: Optional[str] = None, date_to: Optional[str] = None, user: dict = Depends(get_current_user)):
     """Month's Updates tab data. Now fully parallelized."""
     scope: dict = {}
     if user["role"] in {"executive", "sales"}:
         scope["assigned_to"] = user["id"]
 
     now = now_utc()
-    cur_start, cur_end = _month_bounds(now)
+    cur_start = _report_date(date_from, _month_bounds(now)[0])
+    cur_end = _report_date(date_to, _month_bounds(now)[1] - timedelta(microseconds=1))
+    if date_to and len(date_to) == 10:
+        cur_end += timedelta(days=1)
     prev_dt = cur_start - timedelta(days=1)
     prev_start, prev_end = _month_bounds(prev_dt)
 
@@ -5270,14 +5302,16 @@ async def dashboard_monthly(user: dict = Depends(get_current_user)):
 
 
 @api.get("/dashboard/action-items")
-async def dashboard_action_items(user: dict = Depends(get_current_user)):
+async def dashboard_action_items(date_from: Optional[str] = None, date_to: Optional[str] = None, user: dict = Depends(get_current_user)):
     scope: dict = {}
     if user["role"] in {"executive", "sales"}:
         scope["assigned_to"] = user["id"]
 
     now = now_utc()
-    day_start = datetime(now.year, now.month, now.day, tzinfo=timezone.utc)
-    day_end = day_start + timedelta(days=1)
+    day_start = _report_date(date_from, datetime(now.year, now.month, now.day, tzinfo=timezone.utc))
+    day_end = _report_date(date_to, day_start + timedelta(days=1) - timedelta(microseconds=1))
+    if date_to and len(date_to) == 10:
+        day_end += timedelta(days=1)
     def iso(d): return d.isoformat()
 
     # Parallelize phase 1
@@ -5403,7 +5437,7 @@ async def report_summary(
             "unique_outgoing": unique_leads(outgoing_calls), "incoming_calls": len(incoming_calls), "incoming_answered": sum(1 for a in incoming_calls if a.get("meta", {}).get("disposition") in {"connected", "answered"}),
             "sms_sent": len(sms), "emails_sent": len(email), "followups": len(followups), "followups_dismissed": sum(1 for f in followups if f.get("status") == "dismissed"),
         },
-        "by_stage": [{"stage": s, "count": sum(1 for l in leads if l.get("stage") == s)} for s in ["new", "contacted", "qualified", "site_visit", "negotiation", "booked", "lost"]],
+        "by_stage": [{"stage": s, "count": sum(1 for l in leads if l.get("stage") == s)} for s in ["new", "contacted", "contacted_dnp", "qualified", "qualified_dnp", "site_visit", "site_visit_dnp", "negotiation", "negotiation_dnp", "booked", "lost"]],
     }
 
 
@@ -5464,11 +5498,11 @@ async def report_user_status(start: Optional[str] = None, end: Optional[str] = N
     _, _, match = await _report_context(start, end, date_field, user)
     leads = await db.leads.find(match, {"_id": 0}).to_list(20000)
     users = {u["id"]: u.get("name", u["id"]) for u in await db.users.find({}, {"_id": 0, "id": 1, "name": 1}).to_list(500)}
-    stages = ["new", "contacted", "qualified", "site_visit", "negotiation", "booked", "lost"]
+    stages = ["new", "contacted", "contacted_dnp", "qualified", "qualified_dnp", "site_visit", "site_visit_dnp", "negotiation", "negotiation_dnp", "booked", "lost"]
     grouped = {}
     for lead in leads:
         uid = lead.get("assigned_to") or "unassigned"
-        grouped.setdefault(uid, {"user_id": uid, "user": users.get(uid, "Unassigned"), **{s: 0 for s in stages}})[lead.get("stage", "new")] += 1
+        grouped.setdefault(uid, {"user_id": uid, "user": users.get(uid, "Unassigned"), **{s: 0 for s in stages}})[lead.get("stage", "new") if lead.get("stage", "new") in stages else "new"] += 1
     return list(grouped.values())
 
 
@@ -5500,8 +5534,9 @@ async def report_executives(user: dict = Depends(get_current_user)):
 
 
 @api.get("/reports/sources")
-async def report_sources(user: dict = Depends(get_current_user)):
-    pipe = [{"$group": {"_id": {"source": "$source", "stage": "$stage"}, "count": {"$sum": 1}}}]
+async def report_sources(start: Optional[str] = None, end: Optional[str] = None, date_field: str = "created", stage: Optional[str] = None, source: Optional[str] = None, assigned_to: Optional[str] = None, user: dict = Depends(get_current_user)):
+    _, _, match = await _report_context(start, end, date_field, user, stage, source, assigned_to)
+    pipe = [{"$match": match}, {"$group": {"_id": {"source": "$source", "stage": "$stage"}, "count": {"$sum": 1}}}]
     rows = {}
     async for r in db.leads.aggregate(pipe):
         src = r["_id"]["source"]
@@ -6117,6 +6152,8 @@ async def callerdesk_campaign_calls(
     campaign_id: str,
     status_filter: Optional[str] = Query(None, alias="status"),
     search: Optional[str] = None,
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
     user: dict = Depends(require_roles("admin", "manager")),
 ):
     await _expire_old_callerdesk_campaign_calls(campaign_id)
@@ -6126,6 +6163,10 @@ async def callerdesk_campaign_calls(
     if search:
         safe = {"$regex": search, "$options": "i"}
         q["$or"] = [{"phone": safe}, {"call_sid": safe}, {"lead_name": safe}]
+    if date_from or date_to:
+        q["created_at"] = {}
+        if date_from: q["created_at"]["$gte"] = date_from
+        if date_to: q["created_at"]["$lte"] = f"{date_to}T23:59:59.999999+00:00" if len(date_to) == 10 else date_to
     rows = await db.callerdesk_campaign_numbers.find(q, {"_id": 0}).sort("created_at", -1).limit(500).to_list(500)
     if user.get("role") != "admin":
         for row in rows:
