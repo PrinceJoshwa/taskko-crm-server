@@ -2702,6 +2702,8 @@ from typing import Optional, List, Literal
 
 import bcrypt
 import jwt
+from google.oauth2 import service_account
+from googleapiclient.discovery import build as google_build
 from fastapi import FastAPI, APIRouter, Depends, HTTPException, Request, Response, status, Query
 from starlette.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
@@ -3604,17 +3606,44 @@ async def sync_site_visit_calendar_event(visit: dict, action: str = "upsert") ->
         return {"status": "disabled"}
     if not settings.get("google_calendar_credentials_json") or not settings.get("google_calendar_id"):
         return {"status": "pending_credentials", "message": "Google Calendar credentials are not configured"}
-    await db.activities.insert_one({
-        "id": new_id(),
-        "lead_id": visit.get("lead_id"),
-        "actor_id": None,
-        "actor_name": "system",
-        "kind": "calendar_sync_pending",
-        "message": f"Google Calendar {action} prepared for site visit",
-        "meta": {"visit_id": visit.get("id"), "calendar_id": settings.get("google_calendar_id")},
-        "created_at": now_utc().isoformat(),
-    })
-    return {"status": "prepared"}
+    try:
+        credentials_info = json.loads(settings["google_calendar_credentials_json"])
+        credentials = service_account.Credentials.from_service_account_info(
+            credentials_info,
+            scopes=["https://www.googleapis.com/auth/calendar"],
+        )
+        service = google_build("calendar", "v3", credentials=credentials, cache_discovery=False)
+        calendar_id = settings["google_calendar_id"]
+        event_id = visit.get("google_calendar_event_id")
+        if action == "delete":
+            if event_id:
+                await asyncio.to_thread(service.events().delete(calendarId=calendar_id, eventId=event_id, sendUpdates="all").execute)
+            return {"status": "deleted"}
+
+        lead = await db.leads.find_one({"id": visit.get("lead_id")}, {"_id": 0, "name": 1, "email": 1, "co_assigned_to": 1}) or {}
+        owner_ids = list(dict.fromkeys(owner_ids_for_visit(visit) + (lead.get("co_assigned_to") or [])))
+        owners = await db.users.find({"id": {"$in": owner_ids}}, {"_id": 0, "email": 1, "name": 1}).to_list(100)
+        attendees = [{"email": email} for email in dict.fromkeys([lead.get("email")] + [owner.get("email") for owner in owners]) if email]
+        start = datetime.fromisoformat(str(visit["scheduled_at"]).replace("Z", "+00:00"))
+        event = {
+            "summary": f"Site visit: {lead.get('name', 'Lead')}",
+            "description": f"Taskko CRM site visit\\nVisit ID: {visit.get('id')}\\nLead: {lead.get('name', 'Unknown')}",
+            "start": {"dateTime": start.isoformat(), "timeZone": "UTC"},
+            "end": {"dateTime": (start + timedelta(hours=1)).isoformat(), "timeZone": "UTC"},
+            "attendees": attendees,
+            "reminders": {"useDefault": True},
+        }
+        if event_id:
+            result = await asyncio.to_thread(service.events().update(calendarId=calendar_id, eventId=event_id, body=event, sendUpdates="all").execute)
+        else:
+            result = await asyncio.to_thread(service.events().insert(calendarId=calendar_id, body=event, sendUpdates="all").execute)
+            await db.site_visits.update_one({"id": visit["id"]}, {"$set": {"google_calendar_event_id": result["id"]}})
+        await log_activity(visit.get("lead_id"), None, "calendar_synced", f"Google Calendar {action} completed", {"visit_id": visit.get("id"), "event_id": result.get("id")})
+        return {"status": "synced", "event_id": result.get("id")}
+    except Exception as exc:
+        log.warning("Google Calendar sync failed for visit %s: %s", visit.get("id"), exc)
+        await log_activity(visit.get("lead_id"), None, "calendar_sync_failed", "Google Calendar sync failed", {"visit_id": visit.get("id"), "error": str(exc)[:500]})
+        return {"status": "failed", "message": "Calendar sync could not be completed"}
 
 
 # ---------------------------------------------------------------------------
@@ -3689,6 +3718,9 @@ async def update_visit(visit_id: str, body: UpdateSiteVisitBody, actor: dict = D
 
 @api.delete("/site-visits/{visit_id}")
 async def delete_visit(visit_id: str, actor: dict = Depends(require_roles("admin", "manager"))):
+    visit = await db.site_visits.find_one({"id": visit_id}, {"_id": 0})
+    if visit:
+        await sync_site_visit_calendar_event(visit, "delete")
     await db.site_visits.delete_one({"id": visit_id})
     return {"ok": True}
 
