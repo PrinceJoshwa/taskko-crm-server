@@ -5909,7 +5909,9 @@ async def _initiate_twilio_call(lead: dict, actor: dict) -> dict:
 
 async def _initiate_call(lead: dict, actor: dict) -> dict:
     settings = await get_integration_settings()
-    provider = (settings.get("calling_provider") or "twilio").lower()
+    # CallerDesk is Taskko's active calling provider. Twilio remains available
+    # only for installations that explicitly select the legacy provider.
+    provider = (settings.get("calling_provider") or "callerdesk").lower()
     if provider == "twilio":
         return await _initiate_twilio_call(lead, actor)
     if provider == "callerdesk":
