@@ -5816,6 +5816,7 @@ async def _initiate_callerdesk_call(
         "calling_party_a": exec_phone,
         "calling_party_b": lead_phone,
         "deskphone": settings.get("callerdesk_virtual_number"),
+        "call_from_did": 1,
     }
     try:
         resp = await _callerdesk_api_request("GET", "click_to_call_v2", settings, params)
