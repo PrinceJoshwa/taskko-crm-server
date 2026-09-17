@@ -5789,9 +5789,13 @@ async def _initiate_callerdesk_call(
     if not lead.get("phone"):
         raise HTTPException(status_code=400, detail="Lead has no phone number")
     exec_phone = _phone_digits(actor.get("phone"), last10=True)
-    lead_phone = _phone_digits(lead.get("phone"))
+    # CallerDesk C2C expects domestic 10-digit values, as in its documented
+    # click_to_call_v2 request format. Do not send an E.164 country prefix.
+    lead_phone = _phone_digits(lead.get("phone"), last10=True)
     if not exec_phone:
         raise HTTPException(status_code=400, detail="Set your phone number on the Team page first")
+    if _phone_digits(lead_phone, last10=True) == exec_phone:
+        raise HTTPException(status_code=400, detail="The lead phone number matches the agent phone number. Update the lead with the customer's number before calling.")
     if not _callerdesk_configured(settings):
         call_id = await _save_callerdesk_call(
             lead,
