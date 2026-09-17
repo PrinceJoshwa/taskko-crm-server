@@ -1,16 +1,8 @@
 {
-  "version": 2,
-  "regions": ["bom1"],
-  "builds": [
+  "crons": [
     {
-      "src": "api/index.py",
-      "use": "@vercel/python"
-    }
-  ],
-  "routes": [
-    {
-      "src": "/(.*)",
-      "dest": "api/index.py"
+      "path": "/api/jobs/process-due-call-followups",
+      "schedule": "*/1 * * * *"
     }
   ]
 }

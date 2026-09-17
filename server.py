@@ -3371,24 +3371,27 @@ async def list_leads(
     search: Optional[str] = None,
     user: dict = Depends(get_current_user),
 ):
-    q: dict = {}
+    clauses: list[dict] = []
     if project_id:
-        q["project_id"] = project_id
+        clauses.append({"project_id": project_id})
     if stage:
-        q["stage"] = stage
+        clauses.append({"stage": stage})
     if assigned_to:
-        q["assigned_to"] = assigned_to
+        # Filtering by a person includes leads where they are the primary
+        # owner or have been explicitly co-assigned.
+        clauses.append({"$or": [{"assigned_to": assigned_to}, {"co_assigned_to": assigned_to}]})
     if source:
-        q["source"] = source
+        clauses.append({"source": source})
     if search:
-        q["$or"] = [
+        clauses.append({"$or": [
             {"name": {"$regex": search, "$options": "i"}},
             {"phone": {"$regex": search, "$options": "i"}},
             {"email": {"$regex": search, "$options": "i"}},
-        ]
-    # executives only see their leads
+        ]})
+    # Executives see primary and co-owned leads, never another team's work.
     if user["role"] in {"executive", "sales"}:
-        q["assigned_to"] = user["id"]
+        clauses.append({"$or": [{"assigned_to": user["id"]}, {"co_assigned_to": user["id"]}]})
+    q = {} if not clauses else (clauses[0] if len(clauses) == 1 else {"$and": clauses})
     docs = await db.leads.find(q, {"_id": 0}).sort("created_at", -1).to_list(2000)
     return sanitize_many(docs, user)
 
@@ -3488,6 +3491,15 @@ async def co_assign_lead(lead_id: str, body: CoAssignBody, actor: dict = Depends
     ids = [u["id"] for u in users]
     await db.leads.update_one({"id": lead_id}, {"$set": {"co_assigned_to": ids, "updated_at": now_utc().isoformat()}})
     await log_activity(lead_id, actor, "assignment", f"Co-assignees updated: {len(ids)}")
+    for co_owner in users:
+        await create_notification(
+            type="lead_assigned",
+            title="Lead shared with you",
+            message=f"{lead.get('name', 'Lead')} · co-owner access granted",
+            user_id=co_owner["id"],
+            link=f"/leads/{lead_id}",
+            meta={"lead_id": lead_id, "co_owner": True},
+        )
     return sanitize_phone_fields(await db.leads.find_one({"id": lead_id}, {"_id": 0}), actor)
 
 
@@ -3627,7 +3639,7 @@ async def sync_site_visit_calendar_event(visit: dict, action: str = "upsert") ->
         start = datetime.fromisoformat(str(visit["scheduled_at"]).replace("Z", "+00:00"))
         event = {
             "summary": f"Site visit: {lead.get('name', 'Lead')}",
-            "description": f"Taskko CRM site visit\\nVisit ID: {visit.get('id')}\\nLead: {lead.get('name', 'Unknown')}",
+            "description": f"Propzel CRM site visit\\nVisit ID: {visit.get('id')}\\nLead: {lead.get('name', 'Unknown')}",
             "start": {"dateTime": start.isoformat(), "timeZone": "UTC"},
             "end": {"dateTime": (start + timedelta(hours=1)).isoformat(), "timeZone": "UTC"},
             "attendees": attendees,
@@ -3924,7 +3936,7 @@ async def get_settings(user: dict = Depends(get_current_user)):
             "auto_followup_enabled": True,
             "auto_call_on_new_lead": False,
             "missed_call_followup_enabled": True,
-            "missed_call_followup_hours": 24,
+            "missed_call_followup_hours": 1 / 6,
             "calling_provider": "pending",
             "sms_provider": "pending",
             "google_calendar_id": "",
@@ -4710,9 +4722,9 @@ async def whatsapp_api_info(user: dict = Depends(require_roles("admin"))):
             {"method": "POST", "path": "/send", "purpose": "Send text/media/template messages with number, type and message payload"},
         ],
         "taskko_endpoints": [
-            {"method": "POST", "path": "/api/whatsapp/messages", "purpose": "Send a single lead WhatsApp message from Taskko"},
+            {"method": "POST", "path": "/api/whatsapp/messages", "purpose": "Send a single lead WhatsApp message from Propzel"},
             {"method": "POST", "path": "/api/whatsapp/bulk-send", "purpose": "Send or queue a bulk WhatsApp message to selected leads"},
-            {"method": "GET", "path": "/api/whatsapp/conversations", "purpose": "List Taskko WhatsApp conversations"},
+            {"method": "GET", "path": "/api/whatsapp/conversations", "purpose": "List Propzel WhatsApp conversations"},
             {"method": "GET", "path": "/api/whatsapp/qrcode", "purpose": "Fetch provider QR code using configured admin instance"},
         ],
     }
@@ -5778,6 +5790,63 @@ async def _save_callerdesk_call(
     return call_id
 
 
+async def _find_or_create_inbound_callerdesk_lead(phone: Optional[str]) -> Optional[dict]:
+    """Match an inbound CallerDesk caller, or create an assigned CRM lead."""
+    digits = _phone_digits(phone, last10=True)
+    if not digits:
+        return None
+    lead = await db.leads.find_one({"phone": {"$regex": f"{re.escape(digits)}$"}}, {"_id": 0})
+    if lead:
+        return lead
+    assignee_id = await _pick_auto_assignee()
+    now = now_utc().isoformat()
+    lead = {
+        "id": new_id(), "name": f"Inbound caller {digits}", "phone": digits,
+        "source": "manual", "stage": "new", "priority": "warm",
+        "assigned_to": assignee_id, "co_assigned_to": [],
+        "created_at": now, "updated_at": now,
+    }
+    await db.leads.insert_one(lead)
+    await log_activity(lead["id"], {"name": "CallerDesk"}, "lead_created", "Lead created from unmatched inbound CallerDesk call")
+    if assignee_id:
+        await create_notification(
+            type="lead_assigned", title="New inbound call lead",
+            message=f"{lead['name']} was assigned by round robin", user_id=assignee_id,
+            link=f"/leads/{lead['id']}", meta={"lead_id": lead["id"], "source": "callerdesk_inbound"},
+        )
+    return lead
+
+
+async def _schedule_missed_call_retry(lead: Optional[dict], call_sid: Optional[str], status_text: str) -> None:
+    """Create one follow-up per missed provider call; the due-call job dials it."""
+    if not lead:
+        return
+    settings = await get_integration_settings()
+    if not settings.get("missed_call_followup_enabled", True):
+        return
+    call_key = call_sid or f"{lead['id']}:{status_text}"
+    if await db.follow_ups.find_one({"lead_id": lead["id"], "meta.source_call_sid": call_key, "status": "pending"}):
+        return
+    delay_hours = float(settings.get("missed_call_followup_hours", 1 / 6) or 1 / 6)
+    due_at = now_utc() + timedelta(hours=delay_hours)
+    assignee_id = lead.get("assigned_to")
+    await db.follow_ups.insert_one({
+        "id": new_id(), "lead_id": lead["id"], "due_at": due_at.isoformat(), "kind": "call",
+        "notes": f"Automatic retry after CallerDesk {status_text} call", "assigned_to": assignee_id,
+        "status": "pending", "created_at": now_utc().isoformat(),
+        "meta": {"auto": True, "auto_dial": True, "source_call_sid": call_key, "callerdesk_status": status_text},
+    })
+    for user_id in dict.fromkeys([assignee_id, *(lead.get("co_assigned_to") or [])]):
+        if user_id:
+            await create_notification(
+                type="missed_call", title="Missed call retry scheduled",
+                message=f"{lead.get('name', 'Lead')} will be retried in {int(delay_hours * 60)} minutes",
+                user_id=user_id, link=f"/leads/{lead['id']}",
+                meta={"lead_id": lead["id"], "call_sid": call_key},
+                dedupe_key=f"missed-retry:{call_key}:{user_id}",
+            )
+
+
 async def _initiate_callerdesk_call(
     lead: dict,
     actor: dict,
@@ -5860,7 +5929,7 @@ async def _initiate_call(lead: dict, actor: dict) -> dict:
     settings = await get_integration_settings()
     provider = (settings.get("calling_provider") or "callerdesk").lower()
     if provider != "callerdesk":
-        raise HTTPException(status_code=409, detail="Taskko is configured for CallerDesk only. Select CallerDesk in Settings.")
+        raise HTTPException(status_code=409, detail="Propzel is configured for CallerDesk only. Select CallerDesk in Settings.")
     return await _initiate_callerdesk_call(lead, actor)
 
 
@@ -6163,6 +6232,8 @@ async def callerdesk_webhook(request: Request):
 
     call = await db.callerdesk_calls.find_one({"call_sid": call_sid}) if call_sid else None
     lead = await db.leads.find_one({"id": call.get("lead_id")}, {"_id": 0}) if call and call.get("lead_id") else None
+    if not lead and direction != "outgoing":
+        lead = await _find_or_create_inbound_callerdesk_lead(phone_from)
     actor = await db.users.find_one({"id": call.get("actor_id")}, {"_id": 0}) if call and call.get("actor_id") else {"name": "CallerDesk"}
     await _save_callerdesk_call(
         lead,
@@ -6183,6 +6254,8 @@ async def callerdesk_webhook(request: Request):
             {"id": call["campaign_number_id"]},
             {"$set": {"status": status_text, "duration_sec": duration, "call_sid": call_sid, "updated_at": now_utc().isoformat()}},
         )
+    if status_text in {"dnp", "busy", "failed"}:
+        await _schedule_missed_call_retry(lead, call_sid, status_text)
     return {"ok": True}
 
 
@@ -6321,7 +6394,7 @@ async def twilio_recording_callback(request: Request):
 
 @api.get("/twilio/status")
 async def twilio_status(user: dict = Depends(get_current_user)):
-    raise HTTPException(status_code=410, detail="Twilio has been removed. Taskko uses CallerDesk.")
+    raise HTTPException(status_code=410, detail="Twilio has been removed. Propzel uses CallerDesk.")
 
 
 @api.get("/calling/status")
@@ -6414,7 +6487,7 @@ async def export_units(project_id: Optional[str] = None, user: dict = Depends(ge
         ])
         lines.append(line + "\n")
     body = "".join(lines)
-    fname = f"tasko-units-{project_id or 'all'}.csv"
+    fname = f"propzel-units-{project_id or 'all'}.csv"
     return StarletteResponse(
         content=body,
         media_type="text/csv",
@@ -6805,7 +6878,7 @@ def _eod_html(summary: dict) -> str:
     if not rows_html:
         rows_html = "<tr><td colspan='3' style='padding:12px;color:#5C6661;text-align:center;'>No call activity today.</td></tr>"
     return f"""<div style="font-family:Georgia,serif;max-width:640px;margin:0 auto;background:#F6F1E8;padding:32px;color:#102A20;">
-<div style="letter-spacing:0.22em;font-size:11px;text-transform:uppercase;color:#5C6661;">Tasko · Daily Summary</div>
+<div style="letter-spacing:0.22em;font-size:11px;text-transform:uppercase;color:#5C6661;">Propzel · Daily Summary</div>
 <h1 style="font-size:28px;margin:8px 0 4px;letter-spacing:-0.02em;">End of day report</h1>
 <div style="color:#5C6661;font-size:14px;">{summary['date']}</div>
 
@@ -6865,7 +6938,7 @@ def _eod_html(summary: dict) -> str:
 </div>
 
 <div style="margin-top:24px;font-size:11px;color:#5C6661;">
-  Generated by Tasko CRM · {summary['generated_at']}
+  Generated by Propzel CRM · {summary['generated_at']}
 </div>
 </div>"""
 
@@ -6877,7 +6950,7 @@ async def send_eod_email_to_admins() -> dict:
     if not admins:
         return {"sent": 0, "reason": "no admins"}
     html = _eod_html(summary)
-    subject = f"Tasko · End of day report · {summary['date']}"
+    subject = f"Propzel · End of day report · {summary['date']}"
     sent = 0
     errors = []
     for a in admins:
@@ -6923,6 +6996,16 @@ async def admin_eod_email_send(user: dict = Depends(require_roles("admin"))):
     return await send_eod_email_to_admins()
 
 
+@api.post("/jobs/process-due-call-followups")
+async def process_due_call_followups_job(request: Request):
+    """Protected scheduler target for serverless deployments."""
+    cron_secret = os.environ.get("CRON_SECRET", "")
+    auth = request.headers.get("Authorization", "")
+    if not cron_secret or auth != f"Bearer {cron_secret}":
+        raise HTTPException(status_code=401, detail="Unauthorized job request")
+    return await process_due_call_followups()
+
+
 # ---------------------------------------------------------------------------
 # Mount router & CORS
 # ---------------------------------------------------------------------------
@@ -6931,7 +7014,7 @@ app.include_router(api)
 
 @app.get("/api/")
 async def root():
-    return {"service": "Tasko CRM", "version": "1.0.0"}
+    return {"service": "Propzel CRM", "version": "1.0.0"}
 
 
 def _cors_origins() -> list[str]:
@@ -7241,43 +7324,52 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler  # noqa: E402
 from apscheduler.triggers.cron import CronTrigger  # noqa: E402
 
 async def process_due_call_followups():
-    """Automatically trigger the existing auto dialer for due call follow-ups."""
+    """Automatically dial due retries created from missed CallerDesk calls."""
     now_iso = now_utc().isoformat()
-    
-    # 1. Detect pending "call" follow-ups that are due and haven't been auto-dialed
     query = {
         "status": "pending",
         "kind": "call",
         "due_at": {"$lte": now_iso},
+        "meta.auto_dial": True,
         "meta.auto_dialed": {"$ne": True}
     }
-    
     cursor = db.follow_ups.find(query)
-    
+    processed, started, failed = 0, 0, 0
     async for fu in cursor:
         fu_id = fu["id"]
         lead_id = fu.get("lead_id")
         assignee_id = fu.get("assigned_to")
-        
-        # 2. Mark as dialed immediately to prevent duplicate executions
         meta = fu.get("meta") or {}
         meta["auto_dialed"] = True
-        await db.follow_ups.update_one({"id": fu_id}, {"$set": {"meta": meta}})
-        
-        if not lead_id or not assignee_id:
+        meta["auto_dialed_at"] = now_utc().isoformat()
+        claimed = await db.follow_ups.update_one(
+            {"id": fu_id, "meta.auto_dialed": {"$ne": True}}, {"$set": {"meta": meta}}
+        )
+        if not claimed.modified_count:
             continue
-            
-        # 3. Fetch necessary context for the dialer
+        processed += 1
+        if not lead_id or not assignee_id:
+            failed += 1
+            continue
         lead = await db.leads.find_one({"id": lead_id})
         assignee = await db.users.find_one({"id": assignee_id})
-        
-        # 4. Trigger existing auto dialer safely
         if lead and assignee and lead.get("phone") and assignee.get("phone"):
             try:
                 log.info(f"Auto-dialing for follow-up {fu_id} (Lead: {lead_id})")
-                await _initiate_call(lead, assignee)
+                result = await _initiate_call(lead, assignee)
+                meta["auto_dial_result"] = result.get("status", "initiated")
+                await db.follow_ups.update_one({"id": fu_id}, {"$set": {"meta": meta}})
+                started += 1
             except Exception as e:
                 log.warning(f"Failed to auto-dial follow-up {fu_id}: {e}")
+                meta["auto_dial_error"] = str(e)
+                await db.follow_ups.update_one({"id": fu_id}, {"$set": {"meta": meta}})
+                failed += 1
+        else:
+            meta["auto_dial_error"] = "Lead or assigned user has no phone number"
+            await db.follow_ups.update_one({"id": fu_id}, {"$set": {"meta": meta}})
+            failed += 1
+    return {"processed": processed, "started": started, "failed": failed}
 
 _scheduler: Optional[AsyncIOScheduler] = None
 
@@ -7329,7 +7421,7 @@ async def on_startup():
         except Exception as e:
             log.warning("Scheduler setup failed: %s", e)
 
-    log.info("Tasko CRM startup complete.")
+    log.info("Propzel CRM startup complete.")
 
 
 @app.on_event("shutdown")
