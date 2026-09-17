@@ -3898,7 +3898,9 @@ def _with_env_integration_defaults(settings: Optional[dict]) -> dict:
     merged = dict(settings or {})
     defaults = _env_integration_defaults()
     for key, value in defaults.items():
-        if not merged.get(key):
+        # Deployment secrets are authoritative. This prevents a stale value
+        # saved in Settings from overriding the active CallerDesk credential.
+        if key in {"callerdesk_authcode", "callerdesk_webhook_secret"} or not merged.get(key):
             merged[key] = value
     if defaults.get("whatsapp_service_url") and defaults.get("whatsapp_access_token"):
         merged.setdefault("whatsapp_enabled", True)
@@ -5663,7 +5665,7 @@ async def _callerdesk_api_request(method: str, endpoint: str, settings: dict, pa
 
 def _extract_callerdesk_sid(resp: dict) -> Optional[str]:
     """Find the provider call identifier in any response nesting shape."""
-    sid_keys = {"sid_id", "call_sid", "callsid", "sid", "call_id", "callid", "provider_call_id"}
+    sid_keys = {"sid_id", "call_sid", "callsid", "sid", "call_id", "callid", "provider_call_id", "campid", "campaign_id"}
 
     def walk(value):
         if isinstance(value, dict):
@@ -5808,7 +5810,6 @@ async def _initiate_callerdesk_call(
         "calling_party_a": exec_phone,
         "calling_party_b": lead_phone,
         "deskphone": settings.get("callerdesk_virtual_number"),
-        "call_from_did": 1,
     }
     try:
         resp = await _callerdesk_api_request("GET", "click_to_call_v2", settings, params)
