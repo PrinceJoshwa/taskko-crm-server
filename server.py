@@ -7024,6 +7024,7 @@ def _cors_origins() -> list[str]:
         "http://localhost:3001",
         "http://127.0.0.1:3000",
         "https://taskko-crm-client.vercel.app",
+        "https://app.propzel.tech",
     }
     for item in raw.split(","):
         origin = item.strip().rstrip("/")
