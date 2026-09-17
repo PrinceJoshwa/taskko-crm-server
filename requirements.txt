@@ -16,8 +16,6 @@ python-multipart==0.0.32
 
 starlette==0.37.2
 
-twilio==9.10.9
-
 APScheduler==3.11.3
 google-api-python-client==2.200.0
 google-auth==2.58.0

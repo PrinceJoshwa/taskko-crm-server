@@ -5586,32 +5586,12 @@ async def report_sources(start: Optional[str] = None, end: Optional[str] = None,
 
 
 # ---------------------------------------------------------------------------
-# TWILIO VOICE — click-to-call, status + recording callbacks
+# CALLING CONFIG
 # ---------------------------------------------------------------------------
-from twilio.rest import Client as TwilioClient  # noqa: E402
-from twilio.request_validator import RequestValidator  # noqa: E402
-from twilio.twiml.voice_response import VoiceResponse  # noqa: E402
 from fastapi.responses import Response as StarletteResponse  # noqa: E402
 
-TWILIO_SID = os.environ.get("TWILIO_ACCOUNT_SID")
-TWILIO_TOKEN = os.environ.get("TWILIO_AUTH_TOKEN")
-TWILIO_FROM = os.environ.get("TWILIO_FROM_NUMBER")
 BACKEND_PUBLIC_URL = os.environ.get("BACKEND_PUBLIC_URL", "")
 WHATSAPP_WEBHOOK_URL = os.environ.get("WHATSAPP_WEBHOOK_URL", "").strip()
-
-_twilio_client: Optional[TwilioClient] = None
-_twilio_validator: Optional[RequestValidator] = None
-if TWILIO_SID and TWILIO_TOKEN:
-    try:
-        _twilio_client = TwilioClient(TWILIO_SID, TWILIO_TOKEN)
-        _twilio_validator = RequestValidator(TWILIO_TOKEN)
-        log.info("Twilio client initialised (from=%s)", TWILIO_FROM)
-    except Exception as e:
-        log.warning("Twilio init failed: %s", e)
-
-
-def _looks_like_e164(num: str) -> bool:
-    return bool(num) and num.startswith("+") and len(num) >= 8
 
 
 def _phone_digits(num: Optional[str], last10: bool = False) -> str:
@@ -5638,6 +5618,17 @@ def _normalize_call_status(raw: Optional[str], duration_sec: int = 0) -> str:
     if status_text in {"queued", "initiated", "ringing", "in_progress", "dialing"}:
         return status_text
     return status_text or "initiated"
+
+
+def _callerdesk_error_message(response: object) -> Optional[str]:
+    """Return a provider rejection message instead of treating it as a call."""
+    if not isinstance(response, dict):
+        return "CallerDesk returned an invalid response"
+    message = str(response.get("message") or response.get("error") or response.get("detail") or "").strip()
+    kind = str(response.get("type") or response.get("status") or "").lower()
+    if message and ("invalid" in message.lower() or "error" in kind or "fail" in kind):
+        return message
+    return None
 
 
 def _call_kind(direction: str, status_text: str) -> str:
@@ -5824,7 +5815,23 @@ async def _initiate_callerdesk_call(
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"CallerDesk error: {e}")
 
+    rejection = _callerdesk_error_message(resp)
+    if rejection:
+        await _save_callerdesk_call(
+            lead, actor, call_sid=None, direction="outgoing", status_text="failed",
+            phone_from=exec_phone, phone_to=lead_phone, campaign_id=campaign_id,
+            campaign_number_id=campaign_number_id, raw=resp,
+        )
+        raise HTTPException(status_code=400, detail=f"CallerDesk rejected the call: {rejection}. Update CALLERDESK_AUTHCODE with the active code from CallerDesk.")
+
     call_sid = _extract_callerdesk_sid(resp)
+    if not call_sid:
+        await _save_callerdesk_call(
+            lead, actor, call_sid=None, direction="outgoing", status_text="failed",
+            phone_from=exec_phone, phone_to=lead_phone, campaign_id=campaign_id,
+            campaign_number_id=campaign_number_id, raw=resp,
+        )
+        raise HTTPException(status_code=400, detail="CallerDesk did not return a call ID. The call was not initiated.")
     status_text = _normalize_call_status(_extract_callerdesk_value(resp, {"status", "callstatus", "call_status"}, "initiated"))
     call_id = await _save_callerdesk_call(
         lead,
@@ -5841,93 +5848,12 @@ async def _initiate_callerdesk_call(
     return {"call_sid": call_sid, "status": status_text, "provider": "callerdesk", "activity_id": call_id, "raw": resp}
 
 
-async def _initiate_twilio_call(lead: dict, actor: dict) -> dict:
-    """Executive-first bridged call via Twilio. Rings the executive; on answer
-    the TwiML dials the lead and records the conversation."""
-    if not lead.get("phone") or not _looks_like_e164(lead["phone"].replace(" ", "")):
-        raise HTTPException(status_code=400, detail="Lead has no valid E.164 phone")
-    exec_phone = (actor.get("phone") or "").replace(" ", "")
-    if not _looks_like_e164(exec_phone):
-        raise HTTPException(status_code=400, detail="Set your phone (E.164, e.g. +9198…) on the Team page first")
-
-    lead_phone = lead["phone"].replace(" ", "")
-    activity_id = new_id()
-    now = now_utc().isoformat()
-
-    if not _twilio_client or not TWILIO_FROM or not BACKEND_PUBLIC_URL:
-        await db.activities.insert_one({
-            "id": activity_id,
-            "lead_id": lead["id"],
-            "actor_id": actor.get("id"),
-            "actor_name": actor.get("name") or "system",
-            "kind": "outgoing_call",
-            "message": f"[MOCK] Call queued to {lead['name']}",
-            "meta": {"direction": "outgoing", "status": "queued", "mock": True, "to": lead_phone, "from": exec_phone},
-            "created_at": now,
-        })
-        return {"call_sid": None, "status": "mock", "mock": True, "activity_id": activity_id}
-
-    twiml_url = f"{BACKEND_PUBLIC_URL}/api/twilio/twiml/{lead['id']}"
-    status_cb = f"{BACKEND_PUBLIC_URL}/api/twilio/status-callback"
-    recording_cb = f"{BACKEND_PUBLIC_URL}/api/twilio/recording-callback"
-
-    try:
-        call = _twilio_client.calls.create(
-            to=exec_phone,
-            from_=TWILIO_FROM,
-            url=twiml_url,
-            method="POST",
-            status_callback=status_cb,
-            status_callback_event=["initiated", "ringing", "answered", "completed"],
-            status_callback_method="POST",
-            record=True,
-            recording_status_callback=recording_cb,
-            recording_status_callback_method="POST",
-        )
-    except Exception as e:
-        # Return HTTP 400 (not 502) so the preview gateway does not rewrite the JSON body.
-        raise HTTPException(status_code=400, detail=f"Twilio error: {e}")
-
-    await db.activities.insert_one({
-        "id": activity_id,
-        "lead_id": lead["id"],
-        "actor_id": actor.get("id"),
-        "actor_name": actor.get("name") or "system",
-        "kind": "outgoing_call",
-        "message": f"Call initiated to {lead['name']}",
-        "meta": {
-            "direction": "outgoing",
-            "call_sid": call.sid,
-            "status": call.status,
-            "to_lead": lead_phone,
-            "to_exec": exec_phone,
-        },
-        "created_at": now,
-    })
-    return {"call_sid": call.sid, "status": call.status, "mock": False, "activity_id": activity_id}
-
-
 async def _initiate_call(lead: dict, actor: dict) -> dict:
     settings = await get_integration_settings()
-    # CallerDesk is Taskko's active calling provider. Twilio remains available
-    # only for installations that explicitly select the legacy provider.
     provider = (settings.get("calling_provider") or "callerdesk").lower()
-    if provider == "twilio":
-        return await _initiate_twilio_call(lead, actor)
-    if provider == "callerdesk":
-        return await _initiate_callerdesk_call(lead, actor)
-    activity_id = new_id()
-    await db.activities.insert_one({
-        "id": activity_id,
-        "lead_id": lead["id"],
-        "actor_id": actor.get("id"),
-        "actor_name": actor.get("name") or "system",
-        "kind": "outgoing_call",
-        "message": f"[PENDING] Call queued for {lead.get('name', 'Lead')}",
-        "meta": {"direction": "outgoing", "status": "pending_provider", "provider": provider},
-        "created_at": now_utc().isoformat(),
-    })
-    return {"call_sid": None, "status": "pending_provider", "provider": provider, "activity_id": activity_id}
+    if provider != "callerdesk":
+        raise HTTPException(status_code=409, detail="Taskko is configured for CallerDesk only. Select CallerDesk in Settings.")
+    return await _initiate_callerdesk_call(lead, actor)
 
 
 @api.post("/leads/{lead_id}/call")
@@ -6254,6 +6180,7 @@ async def callerdesk_webhook(request: Request):
 
 @api.api_route("/twilio/twiml/{lead_id}", methods=["GET", "POST"])
 async def twilio_twiml(lead_id: str, request: Request):
+    return StarletteResponse(status_code=410)
     lead = await db.leads.find_one({"id": lead_id})
     resp = VoiceResponse()
     if not lead or not lead.get("phone"):
@@ -6288,6 +6215,7 @@ def _twilio_verify(request: Request, form_dict: dict) -> bool:
 
 @api.post("/twilio/status-callback")
 async def twilio_status_callback(request: Request):
+    return StarletteResponse(status_code=410)
     form = dict(await request.form())
     if not _twilio_verify(request, form):
         log.warning("Twilio signature mismatch on status-callback")
@@ -6355,6 +6283,7 @@ async def twilio_status_callback(request: Request):
 
 @api.post("/twilio/recording-callback")
 async def twilio_recording_callback(request: Request):
+    return StarletteResponse(status_code=410)
     form = dict(await request.form())
     if not _twilio_verify(request, form):
         log.warning("Twilio signature mismatch on recording-callback")
@@ -6384,24 +6313,15 @@ async def twilio_recording_callback(request: Request):
 
 @api.get("/twilio/status")
 async def twilio_status(user: dict = Depends(get_current_user)):
-    from_number = TWILIO_FROM if _twilio_client else None
-    return {
-        "configured": bool(_twilio_client),
-        "from_number": from_number if user.get("role") == "admin" else mask_phone(from_number),
-        "webhook_base": BACKEND_PUBLIC_URL,
-    }
+    raise HTTPException(status_code=410, detail="Twilio has been removed. Taskko uses CallerDesk.")
 
 
 @api.get("/calling/status")
 async def calling_status(user: dict = Depends(get_current_user)):
     settings = await get_integration_settings()
-    provider = (settings.get("calling_provider") or "twilio").lower()
-    from_number = TWILIO_FROM if provider == "twilio" and _twilio_client else None
-    if provider == "callerdesk":
-        from_number = settings.get("callerdesk_virtual_number")
-        configured = _callerdesk_configured(settings)
-    else:
-        configured = bool(_twilio_client) if provider == "twilio" else False
+    provider = "callerdesk"
+    from_number = settings.get("callerdesk_virtual_number")
+    configured = _callerdesk_configured(settings)
     return {
         "provider": provider,
         "configured": configured,
