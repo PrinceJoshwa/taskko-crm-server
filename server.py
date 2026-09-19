@@ -2800,12 +2800,26 @@ async def get_current_user(request: Request) -> dict:
     if not user:
         raise HTTPException(status_code=401, detail="User not found")
     user.pop("_id", None)
+    requested_organization_id = request.headers.get("X-Organization-Id", "").strip()
+    if user.get("role") == "super_admin":
+        allowed_organization_ids = {
+            organization["id"]
+            async for organization in db.organizations.find({}, {"id": 1, "_id": 0})
+        }
+        if requested_organization_id:
+            if requested_organization_id not in allowed_organization_ids:
+                raise HTTPException(status_code=403, detail="Organisation access denied")
+            user["active_organization_id"] = requested_organization_id
+        elif len(allowed_organization_ids) == 1:
+            user["active_organization_id"] = next(iter(allowed_organization_ids))
+    else:
+        user["active_organization_id"] = user.get("organization_id")
     return user
 
 
 def require_roles(*roles: str):
     async def dep(user: dict = Depends(get_current_user)) -> dict:
-        if user["role"] not in roles:
+        if user["role"] != "super_admin" and user["role"] not in roles:
             raise HTTPException(status_code=403, detail="Insufficient permissions")
         return user
     return dep
@@ -2855,7 +2869,7 @@ PHONE_META_KEYS = {
 
 
 def sanitize_phone_fields(doc: dict, user: dict) -> dict:
-    if not doc or user.get("role") == "admin":
+    if not doc or user.get("role") in {"admin", "super_admin"}:
         return doc
     sanitized = dict(doc)
     for field in PHONE_FIELDS:
@@ -2870,7 +2884,7 @@ def sanitize_many(docs: list[dict], user: dict) -> list[dict]:
 
 
 def sanitize_phone_meta(value, user: dict, key: Optional[str] = None):
-    if user.get("role") == "admin":
+    if user.get("role") in {"admin", "super_admin"}:
         return value
     normalized_key = key.lower() if key else None
     if isinstance(value, dict):
@@ -2894,7 +2908,7 @@ def sanitize_contact_doc(doc: dict, user: dict) -> dict:
     if not doc:
         return doc
     clean(doc)
-    if user.get("role") == "admin":
+    if user.get("role") in {"admin", "super_admin"}:
         return doc
     sanitized = dict(doc)
     if sanitized.get("phone"):
@@ -2913,7 +2927,11 @@ def owner_ids_for_visit(visit: dict) -> list[str]:
 
 
 async def can_access_lead(lead: dict, user: dict) -> bool:
-    if user.get("role") in {"admin", "manager"}:
+    if lead.get("organization_id") != user.get("active_organization_id") and user.get("role") != "super_admin":
+        return False
+    if user.get("role") == "super_admin" and user.get("active_organization_id") and lead.get("organization_id") != user.get("active_organization_id"):
+        return False
+    if user.get("role") in {"super_admin", "admin", "manager"}:
         return True
     if lead.get("assigned_to") == user.get("id"):
         return True
@@ -2942,7 +2960,7 @@ async def require_lead_access(lead_id: str, user: dict) -> dict:
 # ---------------------------------------------------------------------------
 # Models (pydantic schemas for requests / responses)
 # ---------------------------------------------------------------------------
-Role = Literal["admin", "manager", "executive", "sales"]
+Role = Literal["super_admin", "admin", "manager", "executive", "sales"]
 LeadStage = Literal["new", "contacted", "contacted_dnp", "qualified", "qualified_dnp", "site_visit", "site_visit_dnp", "negotiation", "negotiation_dnp", "booked", "lost"]
 LeadSource = Literal["magicbricks", "99acres", "commonfloor", "housing", "website", "jagathi_website", "google_ads", "facebook", "instagram", "referral", "walk_in", "manual"]
 UnitStatus = Literal["available", "held", "booked", "sold"]
@@ -2965,6 +2983,7 @@ class RegisterBody(BaseDoc):
     name: str
     role: Role = "executive"
     phone: Optional[str] = None
+    organization_id: Optional[str] = None
 
 
 class UpdateUserBody(BaseDoc):
@@ -2973,6 +2992,39 @@ class UpdateUserBody(BaseDoc):
     phone: Optional[str] = None
     active: Optional[bool] = None
     password: Optional[str] = None
+    organization_id: Optional[str] = None
+
+
+class OrganizationBody(BaseDoc):
+    name: str
+    slug: str
+
+
+class OrganizationPatchBody(BaseDoc):
+    name: Optional[str] = None
+    slug: Optional[str] = None
+    active: Optional[bool] = None
+
+
+class OrganizationIntegrationBody(BaseDoc):
+    resend_from_email: Optional[EmailStr] = None
+    resend_api_key: Optional[str] = None
+    resend_domain: Optional[str] = None
+    resend_domain_verified: Optional[bool] = None
+    whatsapp_number: Optional[str] = None
+    whatsapp_provider: Optional[str] = None
+    whatsapp_service_url: Optional[str] = None
+    whatsapp_access_token: Optional[str] = None
+    whatsapp_instance_id: Optional[str] = None
+    portal_api_url: Optional[str] = None
+    portal_api_key: Optional[str] = None
+
+
+class OrganizationTemplateBody(BaseDoc):
+    channel: Literal["email", "whatsapp"]
+    name: str
+    subject: Optional[str] = None
+    body: str
 
 
 class ProjectBody(BaseDoc):
@@ -3135,6 +3187,7 @@ async def log_activity(lead_id: Optional[str], actor: dict, kind: str, message: 
         "kind": kind,
         "message": message,
         "meta": meta or {},
+        "organization_id": (actor or {}).get("active_organization_id") or (actor or {}).get("organization_id"),
         "created_at": now_utc().isoformat(),
     }
     await db.activities.insert_one(doc)
@@ -3188,9 +3241,181 @@ async def refresh(request: Request, response: Response):
 # ---------------------------------------------------------------------------
 # USERS / TEAM
 # ---------------------------------------------------------------------------
+async def _require_organization_access(organization_id: str, user: dict) -> dict:
+    organization = await db.organizations.find_one({"id": organization_id}, {"_id": 0})
+    if not organization:
+        raise HTTPException(status_code=404, detail="Organisation not found")
+    if user.get("role") == "super_admin":
+        return organization
+    elif user.get("organization_id") == organization_id:
+        return organization
+    raise HTTPException(status_code=403, detail="Organisation access denied")
+
+
+def organization_scope(user: dict) -> dict:
+    """Return the database filter for the organisation selected by the actor.
+
+    Super Admin may omit a selection only for aggregate control-panel views; all
+    regular users are always constrained to their stored organisation.
+    """
+    organization_id = user.get("active_organization_id")
+    if organization_id:
+        return {"organization_id": organization_id}
+    if user.get("role") == "super_admin":
+        return {"organization_id": {"$in": user.get("organization_ids") or []}}
+    raise HTTPException(status_code=403, detail="Your account is not assigned to an organisation")
+
+
+def scoped_id_query(record_id: str, user: dict) -> dict:
+    return {"id": record_id, **organization_scope(user)}
+
+
+def _redact_organization_integration(doc: dict) -> dict:
+    safe = dict(doc or {})
+    for key in ("resend_api_key", "whatsapp_access_token", "portal_api_key"):
+        if safe.get(key):
+            safe[f"{key}_configured"] = True
+        safe.pop(key, None)
+    safe.pop("_id", None)
+    return safe
+
+
+@api.get("/organizations")
+async def list_organizations(user: dict = Depends(get_current_user)):
+    query = {} if user.get("role") == "super_admin" else {"id": user.get("organization_id")}
+    return await db.organizations.find(query, {"_id": 0}).sort("name", 1).to_list(100)
+
+
+@api.post("/organizations")
+async def create_organization(body: OrganizationBody, actor: dict = Depends(require_roles("super_admin"))):
+    slug = body.slug.strip().lower()
+    if not slug or not re.fullmatch(r"[a-z0-9-]+", slug):
+        raise HTTPException(status_code=400, detail="Use lowercase letters, numbers, and hyphens for the organisation slug")
+    existing = await db.organizations.find_one({"$or": [{"slug": slug}, {"name": body.name.strip()}]})
+    if existing:
+        return clean(existing)
+    doc = {"id": new_id(), "name": body.name.strip(), "slug": slug, "active": True, "created_at": now_utc().isoformat()}
+    await db.organizations.insert_one(doc)
+    await log_activity(None, actor, "organization_created", f"Organisation created: {doc['name']}", {"organization_id": doc["id"]})
+    return clean(doc)
+
+
+@api.patch("/organizations/{organization_id}")
+async def update_organization(organization_id: str, body: OrganizationPatchBody, actor: dict = Depends(require_roles("super_admin"))):
+    await _require_organization_access(organization_id, actor)
+    update = body.model_dump(exclude_none=True)
+    if "slug" in update:
+        update["slug"] = update["slug"].strip().lower()
+        if not re.fullmatch(r"[a-z0-9-]+", update["slug"]):
+            raise HTTPException(status_code=400, detail="Use lowercase letters, numbers, and hyphens for the organisation slug")
+    if not update:
+        raise HTTPException(status_code=400, detail="Nothing to update")
+    update["updated_at"] = now_utc().isoformat()
+    await db.organizations.update_one({"id": organization_id}, {"$set": update})
+    organization = await db.organizations.find_one({"id": organization_id}, {"_id": 0})
+    await log_activity(None, actor, "organization_updated", f"Organisation updated: {organization['name']}", {"organization_id": organization_id, "changes": list(update)})
+    return organization
+
+
+@api.get("/organizations/{organization_id}/integration")
+async def get_organization_integration(organization_id: str, user: dict = Depends(get_current_user)):
+    await _require_organization_access(organization_id, user)
+    doc = await db.organization_integrations.find_one({"organization_id": organization_id}, {"_id": 0}) or {"organization_id": organization_id}
+    return _redact_organization_integration(doc)
+
+
+@api.put("/organizations/{organization_id}/integration")
+async def update_organization_integration(organization_id: str, body: OrganizationIntegrationBody, user: dict = Depends(require_roles("admin"))):
+    await _require_organization_access(organization_id, user)
+    update = body.model_dump(exclude_none=True)
+    update["organization_id"] = organization_id
+    update["updated_at"] = now_utc().isoformat()
+    await db.organization_integrations.update_one({"organization_id": organization_id}, {"$set": update}, upsert=True)
+    doc = await db.organization_integrations.find_one({"organization_id": organization_id}, {"_id": 0})
+    await log_activity(None, user, "organization_integration_updated", "Organisation delivery configuration updated", {"organization_id": organization_id, "fields": list(update)})
+    return _redact_organization_integration(doc)
+
+
+@api.get("/organizations/{organization_id}/templates")
+async def list_organization_templates(organization_id: str, user: dict = Depends(get_current_user)):
+    await _require_organization_access(organization_id, user)
+    return await db.organization_templates.find({"organization_id": organization_id}, {"_id": 0}).sort("channel", 1).to_list(200)
+
+
+@api.post("/organizations/{organization_id}/templates")
+async def create_organization_template(organization_id: str, body: OrganizationTemplateBody, user: dict = Depends(require_roles("admin"))):
+    await _require_organization_access(organization_id, user)
+    doc = {"id": new_id(), "organization_id": organization_id, **body.model_dump(), "created_at": now_utc().isoformat(), "updated_at": now_utc().isoformat()}
+    await db.organization_templates.insert_one(doc)
+    await log_activity(None, user, "organization_template_created", f"{body.channel.title()} template created: {body.name}", {"organization_id": organization_id, "template_id": doc["id"]})
+    return clean(doc)
+
+
+@api.patch("/organizations/{organization_id}/templates/{template_id}")
+async def update_organization_template(organization_id: str, template_id: str, body: OrganizationTemplateBody, user: dict = Depends(require_roles("admin"))):
+    await _require_organization_access(organization_id, user)
+    update = body.model_dump(exclude_none=True)
+    update["updated_at"] = now_utc().isoformat()
+    result = await db.organization_templates.update_one({"id": template_id, "organization_id": organization_id}, {"$set": update})
+    if not result.matched_count:
+        raise HTTPException(status_code=404, detail="Template not found")
+    await log_activity(None, user, "organization_template_updated", f"Organisation template updated: {body.name}", {"organization_id": organization_id, "template_id": template_id})
+    return await db.organization_templates.find_one({"id": template_id, "organization_id": organization_id}, {"_id": 0})
+
+
+@api.delete("/organizations/{organization_id}/templates/{template_id}")
+async def delete_organization_template(organization_id: str, template_id: str, user: dict = Depends(require_roles("admin"))):
+    await _require_organization_access(organization_id, user)
+    result = await db.organization_templates.delete_one({"id": template_id, "organization_id": organization_id})
+    if not result.deleted_count:
+        raise HTTPException(status_code=404, detail="Template not found")
+    await log_activity(None, user, "organization_template_deleted", "Organisation template deleted", {"organization_id": organization_id, "template_id": template_id})
+    return {"ok": True}
+
+
+@api.get("/super-admin/overview")
+async def super_admin_overview(user: dict = Depends(require_roles("super_admin"))):
+    organizations = await db.organizations.find({}, {"_id": 0}).sort("name", 1).to_list(100)
+
+    async def build_row(organization: dict) -> dict:
+        organization_id = organization["id"]
+        users, leads, activities, projects, visits, followups, integration = await asyncio.gather(
+            db.users.count_documents({"organization_id": organization_id, "active": {"$ne": False}}),
+            db.leads.count_documents({"organization_id": organization_id}),
+            db.activities.count_documents({"organization_id": organization_id}),
+            db.projects.count_documents({"organization_id": organization_id}),
+            db.site_visits.count_documents({"organization_id": organization_id}),
+            db.follow_ups.count_documents({"organization_id": organization_id, "status": "pending"}),
+            db.organization_integrations.find_one({"organization_id": organization_id}, {"_id": 0}),
+        )
+        return {
+            **organization,
+            "stats": {"users": users, "leads": leads, "activities": activities, "projects": projects, "site_visits": visits, "pending_followups": followups},
+            "integration": _redact_organization_integration(integration or {"organization_id": organization_id}),
+        }
+
+    rows = await asyncio.gather(*[build_row(organization) for organization in organizations])
+    return {"organizations": rows, "totals": {
+        "organizations": len(rows),
+        "users": sum(row["stats"]["users"] for row in rows),
+        "leads": sum(row["stats"]["leads"] for row in rows),
+        "activities": sum(row["stats"]["activities"] for row in rows),
+    }}
+
+
+@api.get("/super-admin/audit-logs")
+async def super_admin_audit_logs(organization_id: Optional[str] = None, limit: int = 100, user: dict = Depends(require_roles("super_admin"))):
+    query: dict = {"kind": {"$in": ["organization_created", "organization_updated", "organization_integration_updated", "organization_template_created", "organization_template_updated", "organization_template_deleted", "user_created", "user_updated", "user_deleted", "settings_updated"]}}
+    if organization_id:
+        await _require_organization_access(organization_id, user)
+        query["$or"] = [{"organization_id": organization_id}, {"meta.organization_id": organization_id}]
+    return await db.activities.find(query, {"_id": 0}).sort("created_at", -1).to_list(min(max(limit, 1), 500))
+
+
 @api.get("/users")
 async def list_users(user: dict = Depends(get_current_user)):
-    docs = await db.users.find({}, {"password_hash": 0, "_id": 0}).sort("created_at", -1).to_list(500)
+    query = {} if user.get("role") == "super_admin" else {"organization_id": user.get("organization_id")}
+    docs = await db.users.find(query, {"password_hash": 0, "_id": 0}).sort("created_at", -1).to_list(500)
     return [sanitize_contact_doc(d, user) for d in docs]
 
 
@@ -3199,6 +3424,14 @@ async def create_user(body: RegisterBody, actor: dict = Depends(require_roles("a
     email = body.email.lower().strip()
     if await db.users.find_one({"email": email}):
         raise HTTPException(status_code=400, detail="Email already exists")
+    if body.role == "super_admin" and actor.get("role") != "super_admin":
+        raise HTTPException(status_code=403, detail="Only a Super Admin can create another Super Admin")
+    organization_id = body.organization_id or actor.get("organization_id")
+    if actor.get("role") != "super_admin" and body.organization_id and body.organization_id != actor.get("organization_id"):
+        raise HTTPException(status_code=403, detail="You can only add members to your organisation")
+    if not organization_id:
+        raise HTTPException(status_code=400, detail="Select an organisation for this member")
+    await _require_organization_access(organization_id, actor)
     doc = {
         "id": new_id(),
         "email": email,
@@ -3206,10 +3439,13 @@ async def create_user(body: RegisterBody, actor: dict = Depends(require_roles("a
         "role": body.role,
         "password_hash": hash_password(body.password),
         "phone": body.phone or "",
+        "organization_id": organization_id,
+        "organization_ids": [organization_id],
         "active": True,
         "created_at": now_utc().isoformat(),
     }
     await db.users.insert_one(doc)
+    await log_activity(None, actor, "user_created", f"User created: {doc['name']}", {"organization_id": organization_id, "user_id": doc["id"], "role": doc["role"]})
     return sanitize_contact_doc(clean(doc), actor)
 
 
@@ -3233,14 +3469,28 @@ async def update_self(body: UpdateSelfBody, actor: dict = Depends(get_current_us
 @api.patch("/users/{user_id}")
 async def update_user(user_id: str, body: UpdateUserBody, actor: dict = Depends(require_roles("admin"))):
     update = {k: v for k, v in body.model_dump(exclude_none=True).items() if k != "password"}
+    target = await db.users.find_one({"id": user_id}, {"organization_id": 1, "_id": 0})
+    if not target:
+        raise HTTPException(status_code=404, detail="User not found")
+    if actor.get("role") != "super_admin" and target.get("organization_id") != actor.get("organization_id"):
+        raise HTTPException(status_code=403, detail="You can only update members in your organisation")
+    if actor.get("role") != "super_admin" and update.get("role") in {"admin", "super_admin"}:
+        raise HTTPException(status_code=403, detail="Only a Super Admin can assign Admin or Super Admin roles")
+    if update.get("organization_id"):
+        await _require_organization_access(update["organization_id"], actor)
     if body.password:
         update["password_hash"] = hash_password(body.password)
+        update["password_reset_required"] = True
+    if update.get("organization_id"):
+        update["organization_ids"] = [update["organization_id"]]
     if not update:
         raise HTTPException(status_code=400, detail="Nothing to update")
+    update["updated_at"] = now_utc().isoformat()
     result = await db.users.update_one({"id": user_id}, {"$set": update})
     if result.matched_count == 0:
         raise HTTPException(status_code=404, detail="User not found")
     doc = await db.users.find_one({"id": user_id}, {"password_hash": 0, "_id": 0})
+    await log_activity(None, actor, "user_updated", f"User updated: {doc['name']}", {"organization_id": doc.get("organization_id"), "user_id": user_id, "changes": list(update)})
     return doc
 
 
@@ -3248,9 +3498,15 @@ async def update_user(user_id: str, body: UpdateUserBody, actor: dict = Depends(
 async def delete_user(user_id: str, actor: dict = Depends(require_roles("admin"))):
     if user_id == actor["id"]:
         raise HTTPException(status_code=400, detail="Cannot delete yourself")
-    r = await db.users.delete_one({"id": user_id})
-    if r.deleted_count == 0:
+    target = await db.users.find_one({"id": user_id}, {"_id": 0})
+    if not target:
         raise HTTPException(status_code=404, detail="User not found")
+    if actor.get("role") != "super_admin" and target.get("organization_id") != actor.get("organization_id"):
+        raise HTTPException(status_code=403, detail="You can only remove members in your organisation")
+    if target.get("role") == "super_admin":
+        raise HTTPException(status_code=403, detail="Super Admin accounts cannot be removed here")
+    await db.users.delete_one({"id": user_id})
+    await log_activity(None, actor, "user_deleted", f"User removed: {target['name']}", {"organization_id": target.get("organization_id"), "user_id": user_id})
     return {"ok": True}
 
 
@@ -3259,13 +3515,14 @@ async def delete_user(user_id: str, actor: dict = Depends(require_roles("admin")
 # ---------------------------------------------------------------------------
 @api.get("/projects")
 async def list_projects(user: dict = Depends(get_current_user)):
-    docs = await db.projects.find({}, {"_id": 0}).sort("created_at", -1).to_list(500)
+    scope = organization_scope(user)
+    docs = await db.projects.find(scope, {"_id": 0}).sort("created_at", -1).to_list(500)
     
     async def attach_counts(d):
         units_total, units_avail, leads_count = await asyncio.gather(
-            db.units.count_documents({"project_id": d["id"]}),
-            db.units.count_documents({"project_id": d["id"], "status": "available"}),
-            db.leads.count_documents({"project_id": d["id"]})
+            db.units.count_documents({"project_id": d["id"], **scope}),
+            db.units.count_documents({"project_id": d["id"], "status": "available", **scope}),
+            db.leads.count_documents({"project_id": d["id"], **scope})
         )
         d["units_total"] = units_total
         d["units_available"] = units_avail
@@ -3281,6 +3538,7 @@ async def list_projects(user: dict = Depends(get_current_user)):
 async def create_project(body: ProjectBody, actor: dict = Depends(require_roles("admin", "manager"))):
     doc = body.model_dump()
     doc["id"] = new_id()
+    doc["organization_id"] = organization_scope(actor)["organization_id"]
     doc["created_at"] = now_utc().isoformat()
     await db.projects.insert_one(doc)
     doc.pop("_id", None)
@@ -3290,16 +3548,19 @@ async def create_project(body: ProjectBody, actor: dict = Depends(require_roles(
 @api.patch("/projects/{project_id}")
 async def update_project(project_id: str, body: ProjectBody, actor: dict = Depends(require_roles("admin", "manager"))):
     update = body.model_dump(exclude_none=True)
-    r = await db.projects.update_one({"id": project_id}, {"$set": update})
+    r = await db.projects.update_one(scoped_id_query(project_id, actor), {"$set": update})
     if r.matched_count == 0:
         raise HTTPException(status_code=404, detail="Project not found")
-    return await db.projects.find_one({"id": project_id}, {"_id": 0})
+    return await db.projects.find_one(scoped_id_query(project_id, actor), {"_id": 0})
 
 
 @api.delete("/projects/{project_id}")
 async def delete_project(project_id: str, actor: dict = Depends(require_roles("admin"))):
-    await db.projects.delete_one({"id": project_id})
-    await db.units.delete_many({"project_id": project_id})
+    project = await db.projects.find_one(scoped_id_query(project_id, actor), {"_id": 0})
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+    await db.projects.delete_one(scoped_id_query(project_id, actor))
+    await db.units.delete_many({"project_id": project_id, **organization_scope(actor)})
     return {"ok": True}
 
 
@@ -3308,7 +3569,7 @@ async def delete_project(project_id: str, actor: dict = Depends(require_roles("a
 # ---------------------------------------------------------------------------
 @api.get("/units")
 async def list_units(project_id: Optional[str] = None, user: dict = Depends(get_current_user)):
-    q = {}
+    q = organization_scope(user)
     if project_id:
         q["project_id"] = project_id
     docs = await db.units.find(q, {"_id": 0}).sort([("tower", 1), ("floor", 1), ("unit_no", 1)]).to_list(2000)
@@ -3317,8 +3578,11 @@ async def list_units(project_id: Optional[str] = None, user: dict = Depends(get_
 
 @api.post("/units")
 async def create_unit(body: UnitBody, actor: dict = Depends(require_roles("admin", "manager"))):
+    if not await db.projects.find_one(scoped_id_query(body.project_id, actor), {"_id": 0, "id": 1}):
+        raise HTTPException(status_code=404, detail="Project not found")
     doc = body.model_dump()
     doc["id"] = new_id()
+    doc["organization_id"] = organization_scope(actor)["organization_id"]
     doc["created_at"] = now_utc().isoformat()
     await db.units.insert_one(doc)
     doc.pop("_id", None)
@@ -3331,30 +3595,32 @@ async def update_unit(unit_id: str, body: dict, actor: dict = Depends(require_ro
     update = {k: v for k, v in body.items() if k in allowed}
     if not update:
         raise HTTPException(status_code=400, detail="Nothing to update")
-    r = await db.units.update_one({"id": unit_id}, {"$set": update})
+    r = await db.units.update_one(scoped_id_query(unit_id, actor), {"$set": update})
     if r.matched_count == 0:
         raise HTTPException(status_code=404, detail="Unit not found")
-    return await db.units.find_one({"id": unit_id}, {"_id": 0})
+    return await db.units.find_one(scoped_id_query(unit_id, actor), {"_id": 0})
 
 
 @api.delete("/units/{unit_id}")
 async def delete_unit(unit_id: str, actor: dict = Depends(require_roles("admin", "manager"))):
-    await db.units.delete_one({"id": unit_id})
+    result = await db.units.delete_one(scoped_id_query(unit_id, actor))
+    if not result.deleted_count:
+        raise HTTPException(status_code=404, detail="Unit not found")
     return {"ok": True}
 
 
 # ---------------------------------------------------------------------------
 # LEADS
 # ---------------------------------------------------------------------------
-async def _pick_auto_assignee() -> Optional[str]:
+async def _pick_auto_assignee(organization_id: str) -> Optional[str]:
     """Round-robin among executives that are active."""
-    execs = await db.users.find({"role": "executive", "active": {"$ne": False}}, {"id": 1, "_id": 0}).to_list(200)
+    execs = await db.users.find({"role": "executive", "active": {"$ne": False}, "organization_id": organization_id}, {"id": 1, "_id": 0}).to_list(200)
     if not execs:
         return None
     
     # Run counts concurrently for all executives
     counts = await asyncio.gather(*[
-        db.leads.count_documents({"assigned_to": e["id"], "stage": {"$nin": ["booked", "lost"]}})
+        db.leads.count_documents({"assigned_to": e["id"], "stage": {"$nin": ["booked", "lost"]}, "organization_id": organization_id})
         for e in execs
     ])
     
@@ -3371,7 +3637,7 @@ async def list_leads(
     search: Optional[str] = None,
     user: dict = Depends(get_current_user),
 ):
-    clauses: list[dict] = []
+    clauses: list[dict] = [organization_scope(user)]
     if project_id:
         clauses.append({"project_id": project_id})
     if stage:
@@ -3406,13 +3672,17 @@ async def get_lead(lead_id: str, user: dict = Depends(get_current_user)):
 async def create_lead(body: LeadBody, actor: dict = Depends(require_roles("admin"))):
     doc = body.model_dump()
     doc["id"] = new_id()
+    organization_id = organization_scope(actor).get("organization_id")
+    if not organization_id:
+        raise HTTPException(status_code=400, detail="Select an organisation before creating CRM records")
+    doc["organization_id"] = organization_id
     doc["created_at"] = now_utc().isoformat()
     doc["updated_at"] = doc["created_at"]
     doc.setdefault("priority", "warm")
     if not doc.get("assigned_to"):
-        settings = await db.settings.find_one({"id": "singleton"}) or {}
+        settings = await db.settings.find_one({"id": f"organization:{organization_id}"}) or {}
         if settings.get("auto_assign_enabled", True):
-            doc["assigned_to"] = await _pick_auto_assignee()
+            doc["assigned_to"] = await _pick_auto_assignee(organization_id)
     await db.leads.insert_one(doc)
     doc.pop("_id", None)
     await log_activity(doc["id"], actor, "lead_created", f"Lead created from {doc['source']}")
@@ -3427,7 +3697,7 @@ async def create_lead(body: LeadBody, actor: dict = Depends(require_roles("admin
             meta={"lead_id": doc["id"]},
         )
     # Auto-call on new lead assignment (Twilio)
-    settings = await db.settings.find_one({"id": "singleton"}) or {}
+    settings = await db.settings.find_one({"id": f"organization:{organization_id}"}) or {}
     if settings.get("auto_call_on_new_lead") and doc.get("assigned_to") and doc.get("phone"):
         assignee = await db.users.find_one({"id": doc["assigned_to"]})
         if assignee and assignee.get("phone"):
@@ -3442,34 +3712,34 @@ async def create_lead(body: LeadBody, actor: dict = Depends(require_roles("admin
 
 @api.patch("/leads/{lead_id}")
 async def update_lead(lead_id: str, body: UpdateLeadBody, actor: dict = Depends(require_roles("admin", "manager"))):
-    lead = await db.leads.find_one({"id": lead_id})
+    lead = await db.leads.find_one(scoped_id_query(lead_id, actor))
     if not lead:
         raise HTTPException(status_code=404, detail="Lead not found")
     update = body.model_dump(exclude_none=True)
     if not update:
         raise HTTPException(status_code=400, detail="Nothing to update")
     update["updated_at"] = now_utc().isoformat()
-    r = await db.leads.update_one({"id": lead_id}, {"$set": update})
+    r = await db.leads.update_one(scoped_id_query(lead_id, actor), {"$set": update})
     if r.matched_count == 0:
         raise HTTPException(status_code=404, detail="Lead not found")
     if "stage" in update:
         await log_activity(lead_id, actor, "stage_change", f"Stage moved to {update['stage']}")
     if "assigned_to" in update:
         await log_activity(lead_id, actor, "assignment", f"Assigned to user {update['assigned_to']}")
-    return sanitize_phone_fields(await db.leads.find_one({"id": lead_id}, {"_id": 0}), actor)
+    return sanitize_phone_fields(await db.leads.find_one(scoped_id_query(lead_id, actor), {"_id": 0}), actor)
 
 
 @api.post("/leads/{lead_id}/assign")
 async def assign_lead(lead_id: str, body: AssignBody, actor: dict = Depends(require_roles("admin", "manager"))):
     r = await db.leads.update_one(
-        {"id": lead_id},
+        scoped_id_query(lead_id, actor),
         {"$set": {"assigned_to": body.user_id, "updated_at": now_utc().isoformat()}},
     )
     if r.matched_count == 0:
         raise HTTPException(status_code=404, detail="Lead not found")
-    assignee = await db.users.find_one({"id": body.user_id}, {"name": 1, "_id": 0})
+    assignee = await db.users.find_one({"id": body.user_id, "organization_id": organization_scope(actor).get("organization_id")}, {"name": 1, "_id": 0})
     await log_activity(lead_id, actor, "assignment", f"Assigned to {assignee.get('name', body.user_id) if assignee else body.user_id}")
-    lead = await db.leads.find_one({"id": lead_id}, {"_id": 0})
+    lead = await db.leads.find_one(scoped_id_query(lead_id, actor), {"_id": 0})
     if lead:
         await create_notification(
             type="lead_assigned",
@@ -3484,12 +3754,12 @@ async def assign_lead(lead_id: str, body: AssignBody, actor: dict = Depends(requ
 
 @api.post("/leads/{lead_id}/co-assign")
 async def co_assign_lead(lead_id: str, body: CoAssignBody, actor: dict = Depends(require_roles("admin", "manager"))):
-    lead = await db.leads.find_one({"id": lead_id})
+    lead = await db.leads.find_one(scoped_id_query(lead_id, actor))
     if not lead:
         raise HTTPException(status_code=404, detail="Lead not found")
-    users = await db.users.find({"id": {"$in": body.user_ids}, "active": {"$ne": False}}, {"_id": 0, "id": 1, "name": 1}).to_list(100)
+    users = await db.users.find({"id": {"$in": body.user_ids}, "active": {"$ne": False}, "organization_id": organization_scope(actor).get("organization_id")}, {"_id": 0, "id": 1, "name": 1}).to_list(100)
     ids = [u["id"] for u in users]
-    await db.leads.update_one({"id": lead_id}, {"$set": {"co_assigned_to": ids, "updated_at": now_utc().isoformat()}})
+    await db.leads.update_one(scoped_id_query(lead_id, actor), {"$set": {"co_assigned_to": ids, "updated_at": now_utc().isoformat()}})
     await log_activity(lead_id, actor, "assignment", f"Co-assignees updated: {len(ids)}")
     for co_owner in users:
         await create_notification(
@@ -3500,7 +3770,7 @@ async def co_assign_lead(lead_id: str, body: CoAssignBody, actor: dict = Depends
             link=f"/leads/{lead_id}",
             meta={"lead_id": lead_id, "co_owner": True},
         )
-    return sanitize_phone_fields(await db.leads.find_one({"id": lead_id}, {"_id": 0}), actor)
+    return sanitize_phone_fields(await db.leads.find_one(scoped_id_query(lead_id, actor), {"_id": 0}), actor)
 
 
 @api.post("/leads/{lead_id}/stage")
@@ -3508,11 +3778,11 @@ async def move_stage(lead_id: str, body: StageBody, actor: dict = Depends(requir
     update = {"stage": body.stage, "updated_at": now_utc().isoformat()}
     if body.stage == "lost" and body.note:
         update["lost_reason"] = body.note
-    r = await db.leads.update_one({"id": lead_id}, {"$set": update})
+    r = await db.leads.update_one(scoped_id_query(lead_id, actor), {"$set": update})
     if r.matched_count == 0:
         raise HTTPException(status_code=404, detail="Lead not found")
     await log_activity(lead_id, actor, "stage_change", f"Stage → {body.stage}" + (f": {body.note}" if body.note else ""))
-    return sanitize_phone_fields(await db.leads.find_one({"id": lead_id}, {"_id": 0}), actor)
+    return sanitize_phone_fields(await db.leads.find_one(scoped_id_query(lead_id, actor), {"_id": 0}), actor)
 
 
 @api.post("/leads/{lead_id}/notes")
@@ -3524,10 +3794,10 @@ async def add_note(lead_id: str, body: NoteBody, actor: dict = Depends(get_curre
 
 @api.delete("/leads/{lead_id}")
 async def delete_lead(lead_id: str, actor: dict = Depends(require_roles("admin"))):
-    r = await db.leads.delete_one({"id": lead_id})
+    r = await db.leads.delete_one(scoped_id_query(lead_id, actor))
     if r.deleted_count == 0:
         raise HTTPException(status_code=404, detail="Lead not found")
-    await db.activities.delete_many({"lead_id": lead_id})
+    await db.activities.delete_many({"lead_id": lead_id, **organization_scope(actor)})
     return {"ok": True}
 
 
@@ -3663,7 +3933,7 @@ async def sync_site_visit_calendar_event(visit: dict, action: str = "upsert") ->
 # ---------------------------------------------------------------------------
 @api.get("/site-visits")
 async def list_visits(project_id: Optional[str] = None, lead_id: Optional[str] = None, user: dict = Depends(get_current_user)):
-    q: dict = {}
+    q: dict = organization_scope(user)
     if project_id:
         q["project_id"] = project_id
     if lead_id:
@@ -3678,6 +3948,7 @@ async def list_visits(project_id: Optional[str] = None, lead_id: Optional[str] =
 async def create_visit(body: SiteVisitBody, actor: dict = Depends(get_current_user)):
     doc = body.model_dump()
     doc["id"] = new_id()
+    doc["organization_id"] = organization_scope(actor).get("organization_id")
     doc["status"] = "scheduled"
     doc["scheduled_at"] = doc["scheduled_at"].astimezone(timezone.utc).isoformat()
     doc["created_at"] = now_utc().isoformat()
@@ -3689,7 +3960,7 @@ async def create_visit(body: SiteVisitBody, actor: dict = Depends(get_current_us
     await db.site_visits.insert_one(doc)
     doc.pop("_id", None)
     # advance lead to site_visit stage
-    await db.leads.update_one({"id": doc["lead_id"]}, {"$set": {"stage": "site_visit", "updated_at": now_utc().isoformat()}})
+    await db.leads.update_one(scoped_id_query(doc["lead_id"], actor), {"$set": {"stage": "site_visit", "updated_at": now_utc().isoformat()}})
     await log_activity(doc["lead_id"], actor, "site_visit_scheduled", f"Site visit scheduled at {doc['scheduled_at']}")
     for owner_id in owner_ids_for_visit(doc):
         await create_notification(
@@ -3706,7 +3977,7 @@ async def create_visit(body: SiteVisitBody, actor: dict = Depends(get_current_us
 
 @api.patch("/site-visits/{visit_id}")
 async def update_visit(visit_id: str, body: UpdateSiteVisitBody, actor: dict = Depends(get_current_user)):
-    existing = await db.site_visits.find_one({"id": visit_id}, {"_id": 0})
+    existing = await db.site_visits.find_one(scoped_id_query(visit_id, actor), {"_id": 0})
     if not existing:
         raise HTTPException(status_code=404, detail="Site visit not found")
     await require_lead_access(existing["lead_id"], actor)
@@ -3717,10 +3988,10 @@ async def update_visit(visit_id: str, body: UpdateSiteVisitBody, actor: dict = D
         raise HTTPException(status_code=400, detail="Nothing to update")
     if update.get("assigned_to") and not update.get("presales_owner_id"):
         update["presales_owner_id"] = update["assigned_to"]
-    r = await db.site_visits.update_one({"id": visit_id}, {"$set": update})
+    r = await db.site_visits.update_one(scoped_id_query(visit_id, actor), {"$set": update})
     if r.matched_count == 0:
         raise HTTPException(status_code=404, detail="Site visit not found")
-    v = await db.site_visits.find_one({"id": visit_id}, {"_id": 0})
+    v = await db.site_visits.find_one(scoped_id_query(visit_id, actor), {"_id": 0})
     if "status" in update:
         await log_activity(v["lead_id"], actor, "site_visit_" + update["status"], f"Site visit {update['status']}")
     if any(k in update for k in ("scheduled_at", "status", "presales_owner_id", "sales_owner_id", "project_id")):
@@ -3730,10 +4001,11 @@ async def update_visit(visit_id: str, body: UpdateSiteVisitBody, actor: dict = D
 
 @api.delete("/site-visits/{visit_id}")
 async def delete_visit(visit_id: str, actor: dict = Depends(require_roles("admin", "manager"))):
-    visit = await db.site_visits.find_one({"id": visit_id}, {"_id": 0})
-    if visit:
-        await sync_site_visit_calendar_event(visit, "delete")
-    await db.site_visits.delete_one({"id": visit_id})
+    visit = await db.site_visits.find_one(scoped_id_query(visit_id, actor), {"_id": 0})
+    if not visit:
+        raise HTTPException(status_code=404, detail="Site visit not found")
+    await sync_site_visit_calendar_event(visit, "delete")
+    await db.site_visits.delete_one(scoped_id_query(visit_id, actor))
     return {"ok": True}
 
 
@@ -3742,7 +4014,7 @@ async def delete_visit(visit_id: str, actor: dict = Depends(require_roles("admin
 # ---------------------------------------------------------------------------
 @api.get("/follow-ups")
 async def list_followups(lead_id: Optional[str] = None, status_q: Optional[str] = Query(None, alias="status"), date_from: Optional[str] = None, date_to: Optional[str] = None, user: dict = Depends(get_current_user)):
-    q: dict = {}
+    q: dict = organization_scope(user)
     if lead_id:
         q["lead_id"] = lead_id
     if status_q:
@@ -3763,17 +4035,18 @@ async def list_followups(lead_id: Optional[str] = None, status_q: Optional[str] 
 async def create_followup(body: FollowUpBody, actor: dict = Depends(get_current_user)):
     doc = body.model_dump()
     doc["id"] = new_id()
+    doc["organization_id"] = organization_scope(actor).get("organization_id")
     doc["status"] = "pending"
     doc["due_at"] = doc["due_at"].astimezone(timezone.utc).isoformat()
     doc["created_at"] = now_utc().isoformat()
     if not doc.get("assigned_to"):
-        lead = await db.leads.find_one({"id": doc["lead_id"]}, {"assigned_to": 1})
+        lead = await db.leads.find_one(scoped_id_query(doc["lead_id"], actor), {"assigned_to": 1})
         doc["assigned_to"] = (lead or {}).get("assigned_to")
     await db.follow_ups.insert_one(doc)
     doc.pop("_id", None)
     await log_activity(doc["lead_id"], actor, "followup_scheduled", f"Follow-up scheduled at {doc['due_at']}")
     if doc.get("assigned_to"):
-        lead = await db.leads.find_one({"id": doc["lead_id"]}, {"name": 1, "_id": 0})
+        lead = await db.leads.find_one(scoped_id_query(doc["lead_id"], actor), {"name": 1, "_id": 0})
         await create_notification(
             type="followup_due",
             title="Follow-up scheduled",
@@ -3792,15 +4065,17 @@ async def update_followup(fu_id: str, body: UpdateFollowUpBody, actor: dict = De
         update["due_at"] = update["due_at"].astimezone(timezone.utc).isoformat()
     if not update:
         raise HTTPException(status_code=400, detail="Nothing to update")
-    r = await db.follow_ups.update_one({"id": fu_id}, {"$set": update})
+    r = await db.follow_ups.update_one(scoped_id_query(fu_id, actor), {"$set": update})
     if r.matched_count == 0:
         raise HTTPException(status_code=404, detail="Follow-up not found")
-    return await db.follow_ups.find_one({"id": fu_id}, {"_id": 0})
+    return await db.follow_ups.find_one(scoped_id_query(fu_id, actor), {"_id": 0})
 
 
 @api.delete("/follow-ups/{fu_id}")
 async def delete_followup(fu_id: str, actor: dict = Depends(get_current_user)):
-    await db.follow_ups.delete_one({"id": fu_id})
+    result = await db.follow_ups.delete_one(scoped_id_query(fu_id, actor))
+    if not result.deleted_count:
+        raise HTTPException(status_code=404, detail="Follow-up not found")
     return {"ok": True}
 
 
@@ -3809,7 +4084,9 @@ async def delete_followup(fu_id: str, actor: dict = Depends(get_current_user)):
 # ---------------------------------------------------------------------------
 @api.get("/activities")
 async def list_activities(lead_id: Optional[str] = None, limit: int = 50, user: dict = Depends(get_current_user)):
-    q = {"lead_id": lead_id} if lead_id else {}
+    q = organization_scope(user)
+    if lead_id:
+        q["lead_id"] = lead_id
     if lead_id:
         await require_lead_access(lead_id, user)
     elif user.get("role") not in {"admin", "manager"}:
@@ -3827,7 +4104,7 @@ async def list_activities(lead_id: Optional[str] = None, limit: int = 50, user: 
 # ---------------------------------------------------------------------------
 @api.get("/analytics/summary")
 async def analytics_summary(project_id: Optional[str] = None, user: dict = Depends(get_current_user)):
-    match: dict = {}
+    match: dict = organization_scope(user)
     if project_id:
         match["project_id"] = project_id
     if user["role"] in {"executive", "sales"}:
@@ -3863,8 +4140,8 @@ async def analytics_summary(project_id: Optional[str] = None, user: dict = Depen
         total_leads, visits_today, followups_pending, trend, sources, *stage_results
     ) = await asyncio.gather(
         db.leads.count_documents(match),
-        db.site_visits.count_documents({"scheduled_at": {"$gte": today_start, "$lte": today_end}}),
-        db.follow_ups.count_documents({"status": "pending"}),
+        db.site_visits.count_documents({**organization_scope(user), "scheduled_at": {"$gte": today_start, "$lte": today_end}}),
+        db.follow_ups.count_documents({**organization_scope(user), "status": "pending"}),
         get_trend(),
         get_sources(),
         *stage_tasks
@@ -3923,10 +4200,15 @@ def _with_env_integration_defaults(settings: Optional[dict]) -> dict:
 
 @api.get("/settings")
 async def get_settings(user: dict = Depends(get_current_user)):
-    s = await db.settings.find_one({"id": "singleton"}, {"_id": 0})
+    organization_id = organization_scope(user).get("organization_id")
+    if not organization_id:
+        raise HTTPException(status_code=400, detail="Select an organisation to view settings")
+    settings_id = f"organization:{organization_id}"
+    s = await db.settings.find_one({"id": settings_id}, {"_id": 0})
     if not s:
         s = {
-            "id": "singleton",
+            "id": settings_id,
+            "organization_id": organization_id,
             "whatsapp_enabled": False,
             "email_enabled": False,
             "google_calendar_enabled": False,
@@ -3948,7 +4230,7 @@ async def get_settings(user: dict = Depends(get_current_user)):
         }
         await db.settings.insert_one(s.copy())
     s = _with_env_integration_defaults(s)
-    if user.get("role") != "admin":
+    if user.get("role") not in {"admin", "super_admin"}:
         if s.get("whatsapp_number"):
             s["whatsapp_number"] = mask_phone(s["whatsapp_number"])
         s.pop("google_calendar_credentials_json", None)
@@ -3963,8 +4245,14 @@ async def get_settings(user: dict = Depends(get_current_user)):
 @api.patch("/settings")
 async def update_settings(body: SettingsBody, actor: dict = Depends(require_roles("admin"))):
     update = body.model_dump(exclude_none=True)
-    await db.settings.update_one({"id": "singleton"}, {"$set": update}, upsert=True)
-    s = await db.settings.find_one({"id": "singleton"}, {"_id": 0})
+    organization_id = organization_scope(actor).get("organization_id")
+    if not organization_id:
+        raise HTTPException(status_code=400, detail="Select an organisation before updating settings")
+    settings_id = f"organization:{organization_id}"
+    update.update({"id": settings_id, "organization_id": organization_id, "updated_at": now_utc().isoformat()})
+    await db.settings.update_one({"id": settings_id}, {"$set": update}, upsert=True)
+    s = await db.settings.find_one({"id": settings_id}, {"_id": 0})
+    await log_activity(None, actor, "settings_updated", "Organisation settings updated", {"organization_id": organization_id, "fields": list(update)})
     return s
 
 
@@ -5017,11 +5305,11 @@ class BulkAssignBody(BaseDoc):
 async def bulk_assign(body: BulkAssignBody, actor: dict = Depends(require_roles("admin"))):
     if not body.lead_ids:
         raise HTTPException(status_code=400, detail="No leads provided")
-    user = await db.users.find_one({"id": body.user_id}, {"name": 1})
+    user = await db.users.find_one({"id": body.user_id, "organization_id": organization_scope(actor).get("organization_id")}, {"name": 1})
     if not user:
         raise HTTPException(status_code=404, detail="Assignee not found")
     result = await db.leads.update_many(
-        {"id": {"$in": body.lead_ids}},
+        {"id": {"$in": body.lead_ids}, **organization_scope(actor)},
         {"$set": {"assigned_to": body.user_id, "updated_at": now_utc().isoformat()}},
     )
     for lid in body.lead_ids:
@@ -5052,13 +5340,17 @@ class ImportBody(BaseDoc):
 
 @api.post("/leads/import")
 async def import_leads(body: ImportBody, actor: dict = Depends(require_roles("admin"))):
-    projects = {p["name"].lower(): p["id"] async for p in db.projects.find({}, {"id": 1, "name": 1})}
+    organization_id = organization_scope(actor).get("organization_id")
+    if not organization_id:
+        raise HTTPException(status_code=400, detail="Select an organisation before importing leads")
+    projects = {p["name"].lower(): p["id"] async for p in db.projects.find({"organization_id": organization_id}, {"id": 1, "name": 1})}
     created, failed = 0, 0
     for row in body.rows:
         try:
             pid = projects.get((row.project_name or "").lower())
             doc = {
                 "id": new_id(),
+                "organization_id": organization_id,
                 "name": row.name,
                 "phone": row.phone,
                 "email": row.email,
@@ -5076,7 +5368,7 @@ async def import_leads(body: ImportBody, actor: dict = Depends(require_roles("ad
                 "updated_at": now_utc().isoformat(),
             }
             if body.auto_assign:
-                doc["assigned_to"] = await _pick_auto_assignee()
+                doc["assigned_to"] = await _pick_auto_assignee(organization_id)
             await db.leads.insert_one(doc)
             await log_activity(doc["id"], actor, "lead_created", "Imported via CSV")
             created += 1
@@ -5098,7 +5390,7 @@ class WATemplateBody(BaseDoc):
 
 @api.get("/whatsapp-templates")
 async def list_wa_templates(user: dict = Depends(require_roles("admin"))):
-    docs = await db.whatsapp_templates.find({}, {"_id": 0}).sort("created_at", -1).to_list(500)
+    docs = await db.whatsapp_templates.find(organization_scope(user), {"_id": 0}).sort("created_at", -1).to_list(500)
     return docs
 
 
@@ -5106,6 +5398,7 @@ async def list_wa_templates(user: dict = Depends(require_roles("admin"))):
 async def create_wa_template(body: WATemplateBody, actor: dict = Depends(require_roles("admin"))):
     doc = body.model_dump()
     doc["id"] = new_id()
+    doc["organization_id"] = organization_scope(actor).get("organization_id")
     doc["created_at"] = now_utc().isoformat()
     await db.whatsapp_templates.insert_one(doc)
     doc.pop("_id", None)
@@ -5114,15 +5407,17 @@ async def create_wa_template(body: WATemplateBody, actor: dict = Depends(require
 
 @api.patch("/whatsapp-templates/{tid}")
 async def update_wa_template(tid: str, body: WATemplateBody, actor: dict = Depends(require_roles("admin"))):
-    r = await db.whatsapp_templates.update_one({"id": tid}, {"$set": body.model_dump(exclude_none=True)})
+    r = await db.whatsapp_templates.update_one(scoped_id_query(tid, actor), {"$set": body.model_dump(exclude_none=True)})
     if r.matched_count == 0:
         raise HTTPException(status_code=404, detail="Template not found")
-    return await db.whatsapp_templates.find_one({"id": tid}, {"_id": 0})
+    return await db.whatsapp_templates.find_one(scoped_id_query(tid, actor), {"_id": 0})
 
 
 @api.delete("/whatsapp-templates/{tid}")
 async def delete_wa_template(tid: str, actor: dict = Depends(require_roles("admin"))):
-    await db.whatsapp_templates.delete_one({"id": tid})
+    result = await db.whatsapp_templates.delete_one(scoped_id_query(tid, actor))
+    if not result.deleted_count:
+        raise HTTPException(status_code=404, detail="Template not found")
     return {"ok": True}
 
 
@@ -5143,9 +5438,10 @@ class ChannelPartnerBody(BaseDoc):
 
 @api.get("/channel-partners")
 async def list_partners(user: dict = Depends(get_current_user)):
-    docs = await db.channel_partners.find({}, {"_id": 0}).sort("created_at", -1).to_list(500)
+    scope = organization_scope(user)
+    docs = await db.channel_partners.find(scope, {"_id": 0}).sort("created_at", -1).to_list(500)
     for d in docs:
-        d["leads_count"] = await db.leads.count_documents({"channel_partner_id": d["id"]})
+        d["leads_count"] = await db.leads.count_documents({"channel_partner_id": d["id"], **scope})
     return [sanitize_contact_doc(d, user) for d in docs]
 
 
@@ -5153,6 +5449,7 @@ async def list_partners(user: dict = Depends(get_current_user)):
 async def create_partner(body: ChannelPartnerBody, actor: dict = Depends(require_roles("admin"))):
     doc = body.model_dump()
     doc["id"] = new_id()
+    doc["organization_id"] = organization_scope(actor).get("organization_id")
     doc["created_at"] = now_utc().isoformat()
     await db.channel_partners.insert_one(doc)
     doc.pop("_id", None)
@@ -5161,15 +5458,17 @@ async def create_partner(body: ChannelPartnerBody, actor: dict = Depends(require
 
 @api.patch("/channel-partners/{pid}")
 async def update_partner(pid: str, body: ChannelPartnerBody, actor: dict = Depends(require_roles("admin"))):
-    r = await db.channel_partners.update_one({"id": pid}, {"$set": body.model_dump(exclude_none=True)})
+    r = await db.channel_partners.update_one(scoped_id_query(pid, actor), {"$set": body.model_dump(exclude_none=True)})
     if r.matched_count == 0:
         raise HTTPException(status_code=404, detail="Partner not found")
-    return sanitize_contact_doc(await db.channel_partners.find_one({"id": pid}, {"_id": 0}), actor)
+    return sanitize_contact_doc(await db.channel_partners.find_one(scoped_id_query(pid, actor), {"_id": 0}), actor)
 
 
 @api.delete("/channel-partners/{pid}")
 async def delete_partner(pid: str, actor: dict = Depends(require_roles("admin"))):
-    await db.channel_partners.delete_one({"id": pid})
+    result = await db.channel_partners.delete_one(scoped_id_query(pid, actor))
+    if not result.deleted_count:
+        raise HTTPException(status_code=404, detail="Partner not found")
     return {"ok": True}
 
 
@@ -5195,7 +5494,7 @@ class UpdateProposalBody(BaseDoc):
 
 @api.get("/proposals")
 async def list_proposals(lead_id: Optional[str] = None, user: dict = Depends(get_current_user)):
-    q = {}
+    q = organization_scope(user)
     if lead_id:
         q["lead_id"] = lead_id
     docs = await db.proposals.find(q, {"_id": 0}).sort("created_at", -1).to_list(500)
@@ -5204,8 +5503,10 @@ async def list_proposals(lead_id: Optional[str] = None, user: dict = Depends(get
 
 @api.post("/proposals")
 async def create_proposal(body: ProposalBody, actor: dict = Depends(get_current_user)):
+    await require_lead_access(body.lead_id, actor)
     doc = body.model_dump()
     doc["id"] = new_id()
+    doc["organization_id"] = organization_scope(actor).get("organization_id")
     doc["created_at"] = now_utc().isoformat()
     doc["created_by"] = actor["id"]
     await db.proposals.insert_one(doc)
@@ -5217,10 +5518,10 @@ async def create_proposal(body: ProposalBody, actor: dict = Depends(get_current_
 @api.patch("/proposals/{prop_id}")
 async def update_proposal(prop_id: str, body: UpdateProposalBody, actor: dict = Depends(get_current_user)):
     update = body.model_dump(exclude_none=True)
-    r = await db.proposals.update_one({"id": prop_id}, {"$set": update})
+    r = await db.proposals.update_one(scoped_id_query(prop_id, actor), {"$set": update})
     if r.matched_count == 0:
         raise HTTPException(status_code=404, detail="Proposal not found")
-    prop = await db.proposals.find_one({"id": prop_id}, {"_id": 0})
+    prop = await db.proposals.find_one(scoped_id_query(prop_id, actor), {"_id": 0})
     if "status" in update:
         await log_activity(prop["lead_id"], actor, "proposal_" + update["status"], f"Proposal marked {update['status']}")
     return prop
@@ -5228,7 +5529,9 @@ async def update_proposal(prop_id: str, body: UpdateProposalBody, actor: dict = 
 
 @api.delete("/proposals/{prop_id}")
 async def delete_proposal(prop_id: str, actor: dict = Depends(require_roles("admin", "manager"))):
-    await db.proposals.delete_one({"id": prop_id})
+    result = await db.proposals.delete_one(scoped_id_query(prop_id, actor))
+    if not result.deleted_count:
+        raise HTTPException(status_code=404, detail="Proposal not found")
     return {"ok": True}
 
 
@@ -5247,7 +5550,7 @@ def _month_bounds(dt: datetime) -> tuple:
 @api.get("/dashboard/monthly")
 async def dashboard_monthly(date_from: Optional[str] = None, date_to: Optional[str] = None, user: dict = Depends(get_current_user)):
     """Month's Updates tab data. Now fully parallelized."""
-    scope: dict = {}
+    scope: dict = organization_scope(user)
     if user["role"] in {"executive", "sales"}:
         scope["assigned_to"] = user["id"]
 
@@ -5263,7 +5566,7 @@ async def dashboard_monthly(date_from: Optional[str] = None, date_to: Optional[s
 
     async def get_cur_revenue():
         cur_rev_pipe = [
-            {"$match": {"status": "accepted", "created_at": {"$gte": iso(cur_start), "$lt": iso(cur_end)}}},
+            {"$match": {**scope, "status": "accepted", "created_at": {"$gte": iso(cur_start), "$lt": iso(cur_end)}}},
             {"$group": {"_id": None, "total": {"$sum": "$amount"}}},
         ]
         docs = [r async for r in db.proposals.aggregate(cur_rev_pipe)]
@@ -5271,7 +5574,7 @@ async def dashboard_monthly(date_from: Optional[str] = None, date_to: Optional[s
 
     async def get_prev_revenue():
         prev_rev_pipe = [
-            {"$match": {"status": "accepted", "created_at": {"$gte": iso(prev_start), "$lt": iso(prev_end)}}},
+            {"$match": {**scope, "status": "accepted", "created_at": {"$gte": iso(prev_start), "$lt": iso(prev_end)}}},
             {"$group": {"_id": None, "total": {"$sum": "$amount"}}},
         ]
         docs = [r async for r in db.proposals.aggregate(prev_rev_pipe)]
@@ -5290,7 +5593,7 @@ async def dashboard_monthly(date_from: Optional[str] = None, date_to: Optional[s
                 ("sms_sent", ["sms_sent"]),
                 ("followup_scheduled", ["followup_scheduled"]),
             ):
-                tasks.append(db.activities.count_documents({
+                tasks.append(db.activities.count_documents({**scope,
                     "kind": {"$in": kinds},
                     "created_at": {"$gte": iso(ms), "$lt": iso(me)},
                 }))
@@ -5349,7 +5652,7 @@ async def dashboard_monthly(date_from: Optional[str] = None, date_to: Optional[s
 
 @api.get("/dashboard/action-items")
 async def dashboard_action_items(date_from: Optional[str] = None, date_to: Optional[str] = None, user: dict = Depends(get_current_user)):
-    scope: dict = {}
+    scope: dict = organization_scope(user)
     if user["role"] in {"executive", "sales"}:
         scope["assigned_to"] = user["id"]
 
@@ -5362,8 +5665,8 @@ async def dashboard_action_items(date_from: Optional[str] = None, date_to: Optio
 
     # Parallelize phase 1
     (missed, dnp_calls, todays_followups, scheduled_calls, tasks, planned_visits, lead_docs) = await asyncio.gather(
-        db.activities.count_documents({"kind": "missed_call", "created_at": {"$gte": iso(day_start), "$lt": iso(day_end)}}),
-        db.activities.count_documents({"kind": "missed_call", "meta.disposition": "dnp", "created_at": {"$gte": iso(day_start), "$lt": iso(day_end)}}),
+        db.activities.count_documents({**scope, "kind": "missed_call", "created_at": {"$gte": iso(day_start), "$lt": iso(day_end)}}),
+        db.activities.count_documents({**scope, "kind": "missed_call", "meta.disposition": "dnp", "created_at": {"$gte": iso(day_start), "$lt": iso(day_end)}}),
         db.follow_ups.find({**scope, "status": "pending", "due_at": {"$gte": iso(day_start), "$lt": iso(day_end)}}, {"_id": 0}).sort("due_at", 1).to_list(100),
         db.follow_ups.count_documents({**scope, "status": "pending", "kind": "call"}),
         db.follow_ups.count_documents({**scope, "status": "pending", "kind": {"$in": ["meeting", "email", "whatsapp"]}}),
@@ -5433,7 +5736,7 @@ async def _report_context(
         end_dt = end_dt + timedelta(days=1) - timedelta(microseconds=1)
     start_dt = _report_date(start, end_dt - timedelta(days=30))
     field = "updated_at" if date_field == "updated" else "created_at"
-    match = {field: {"$gte": start_dt.isoformat(), "$lte": end_dt.isoformat()}}
+    match = {**organization_scope(user), field: {"$gte": start_dt.isoformat(), "$lte": end_dt.isoformat()}}
     if stage and stage != "all":
         match["stage"] = stage
     if source and source != "all":
@@ -5460,13 +5763,13 @@ async def report_summary(
     user: dict = Depends(get_current_user),
 ):
     start_dt, end_dt, lead_match = await _report_context(start, end, date_field, user, stage, source, assigned_to)
-    activity_match = {"created_at": {"$gte": start_dt.isoformat(), "$lte": end_dt.isoformat()}}
+    activity_match = {**organization_scope(user), "created_at": {"$gte": start_dt.isoformat(), "$lte": end_dt.isoformat()}}
     if user.get("role") in {"executive", "sales"}:
         activity_match["actor_id"] = user["id"]
     leads, activities, followups = await asyncio.gather(
         db.leads.find(lead_match, {"_id": 0}).to_list(5000),
         db.activities.find(activity_match, {"_id": 0}).to_list(10000),
-        db.follow_ups.find({"created_at": activity_match["created_at"], "status": {"$in": ["pending", "completed", "dismissed"]}}, {"_id": 0}).to_list(5000),
+        db.follow_ups.find({**organization_scope(user), "created_at": activity_match["created_at"], "status": {"$in": ["pending", "completed", "dismissed"]}}, {"_id": 0}).to_list(5000),
     )
     outgoing_calls = [a for a in activities if a.get("kind") in {"outgoing_call", "call", "missed_call"} and a.get("meta", {}).get("direction", "outgoing") == "outgoing"]
     incoming_calls = [a for a in activities if a.get("kind") == "incoming_call" or a.get("meta", {}).get("direction") == "incoming"]
@@ -5490,14 +5793,14 @@ async def report_summary(
 @api.get("/reports/activity")
 async def report_activity(start: Optional[str] = None, end: Optional[str] = None, date_field: str = "created", assigned_to: Optional[str] = None, user: dict = Depends(get_current_user)):
     start_dt, end_dt, lead_match = await _report_context(start, end, date_field, user, assigned_to=assigned_to)
-    rows = await db.activities.find({"created_at": {"$gte": start_dt.isoformat(), "$lte": end_dt.isoformat()}}, {"_id": 0}).to_list(20000)
+    rows = await db.activities.find({**organization_scope(user), "created_at": {"$gte": start_dt.isoformat(), "$lte": end_dt.isoformat()}}, {"_id": 0}).to_list(20000)
     if "assigned_to" in lead_match:
         scoped = await db.leads.find(lead_match, {"_id": 0, "id": 1}).to_list(20000)
         allowed = {lead["id"] for lead in scoped}
         rows = [row for row in rows if row.get("lead_id") in allowed]
-    users = {u["id"]: u.get("name", u["id"]) for u in await db.users.find({}, {"_id": 0, "id": 1, "name": 1}).to_list(500)}
+    users = {u["id"]: u.get("name", u["id"]) for u in await db.users.find({"organization_id": organization_scope(user).get("organization_id")}, {"_id": 0, "id": 1, "name": 1}).to_list(500)}
     lead_ids = list({r.get("lead_id") for r in rows if r.get("lead_id")})
-    leads = {l["id"]: l for l in await db.leads.find({"id": {"$in": lead_ids}}, {"_id": 0}).to_list(len(lead_ids) or 1)}
+    leads = {l["id"]: l for l in await db.leads.find({"id": {"$in": lead_ids}, **organization_scope(user)}, {"_id": 0}).to_list(len(lead_ids) or 1)}
     grouped = {}
     for row in rows:
         actor = row.get("actor_id") or row.get("user_id") or "unassigned"
@@ -5522,7 +5825,7 @@ async def report_activity(start: Optional[str] = None, end: Optional[str] = None
 @api.get("/reports/daily")
 async def report_daily(start: Optional[str] = None, end: Optional[str] = None, user: dict = Depends(get_current_user)):
     start_dt, end_dt, _ = await _report_context(start, end, "created", user)
-    rows = await db.activities.find({"created_at": {"$gte": start_dt.isoformat(), "$lte": end_dt.isoformat()}}, {"_id": 0}).to_list(20000)
+    rows = await db.activities.find({**organization_scope(user), "created_at": {"$gte": start_dt.isoformat(), "$lte": end_dt.isoformat()}}, {"_id": 0}).to_list(20000)
     buckets = {}
     cursor = start_dt.date()
     while cursor <= end_dt.date():
