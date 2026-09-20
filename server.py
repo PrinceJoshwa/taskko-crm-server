@@ -3413,8 +3413,13 @@ async def super_admin_audit_logs(organization_id: Optional[str] = None, limit: i
 
 
 @api.get("/users")
-async def list_users(user: dict = Depends(get_current_user)):
-    query = {} if user.get("role") == "super_admin" else {"organization_id": user.get("organization_id")}
+async def list_users(all_organizations: bool = False, user: dict = Depends(get_current_user)):
+    # Team is an organisation workspace.  Only the Super Admin control panel
+    # may explicitly request the cross-organisation directory.
+    if user.get("role") == "super_admin" and all_organizations:
+        query = {}
+    else:
+        query = organization_scope(user)
     docs = await db.users.find(query, {"password_hash": 0, "_id": 0}).sort("created_at", -1).to_list(500)
     return [sanitize_contact_doc(d, user) for d in docs]
 
@@ -3633,6 +3638,7 @@ async def list_leads(
     project_id: Optional[str] = None,
     stage: Optional[str] = None,
     assigned_to: Optional[str] = None,
+    owner_mode: Literal["any", "primary", "co_owner"] = "any",
     source: Optional[str] = None,
     search: Optional[str] = None,
     user: dict = Depends(get_current_user),
@@ -3643,9 +3649,13 @@ async def list_leads(
     if stage:
         clauses.append({"stage": stage})
     if assigned_to:
-        # Filtering by a person includes leads where they are the primary
-        # owner or have been explicitly co-assigned.
-        clauses.append({"$or": [{"assigned_to": assigned_to}, {"co_assigned_to": assigned_to}]})
+        if owner_mode == "primary":
+            clauses.append({"assigned_to": assigned_to})
+        elif owner_mode == "co_owner":
+            clauses.append({"co_assigned_to": assigned_to})
+        else:
+            # The default preserves the existing inclusive owner search.
+            clauses.append({"$or": [{"assigned_to": assigned_to}, {"co_assigned_to": assigned_to}]})
     if source:
         clauses.append({"source": source})
     if search:
@@ -4304,8 +4314,18 @@ class MessageCampaignPatchBody(BaseDoc):
     status: Optional[Literal["draft", "active", "paused", "completed", "cancelled"]] = None
 
 
-async def get_integration_settings() -> dict:
-    return _with_env_integration_defaults(await db.settings.find_one({"id": "singleton"}, {"_id": 0}))
+async def get_integration_settings(organization_id: Optional[str] = None) -> dict:
+    """Load the selected organisation's delivery settings.
+
+    The singleton is retained only as a legacy fallback; new calling, email and
+    WhatsApp behaviour must never borrow another organisation's configuration.
+    """
+    settings = None
+    if organization_id:
+        settings = await db.settings.find_one({"id": f"organization:{organization_id}"}, {"_id": 0})
+    if not settings:
+        settings = await db.settings.find_one({"id": "singleton"}, {"_id": 0})
+    return _with_env_integration_defaults(settings)
 
 
 def _provider_configured(settings: dict, prefix: str) -> bool:
@@ -6037,6 +6057,7 @@ async def _save_callerdesk_call(
 ) -> str:
     now = now_utc().isoformat()
     call_id = new_id()
+    organization_id = (lead or {}).get("organization_id") or (actor or {}).get("active_organization_id") or (actor or {}).get("organization_id")
     doc = {
         "id": call_id,
         "provider": "callerdesk",
@@ -6054,11 +6075,12 @@ async def _save_callerdesk_call(
         "campaign_id": campaign_id,
         "campaign_number_id": campaign_number_id,
         "raw": raw or {},
+        "organization_id": organization_id,
         "created_at": now,
         "updated_at": now,
     }
     if call_sid:
-        await db.callerdesk_calls.update_one({"call_sid": call_sid}, {"$set": doc}, upsert=True)
+        await db.callerdesk_calls.update_one({"call_sid": call_sid, "organization_id": organization_id}, {"$set": doc}, upsert=True)
     else:
         await db.callerdesk_calls.insert_one(doc)
 
@@ -6069,6 +6091,7 @@ async def _save_callerdesk_call(
             "actor_name": (actor or {}).get("name") or "system",
             "kind": _call_kind(direction, status_text),
             "message": f"CallerDesk call {status_text} · {duration_sec}s",
+            "organization_id": organization_id,
             "meta": {
                 "provider": "callerdesk",
                 "direction": direction,
@@ -6083,7 +6106,7 @@ async def _save_callerdesk_call(
             },
         }
         if call_sid:
-            existing_activity = await db.activities.find_one({"meta.call_sid": call_sid})
+            existing_activity = await db.activities.find_one({"meta.call_sid": call_sid, "organization_id": organization_id})
             if existing_activity:
                 await db.activities.update_one({"id": existing_activity["id"]}, {"$set": activity})
             else:
@@ -6093,24 +6116,25 @@ async def _save_callerdesk_call(
     return call_id
 
 
-async def _find_or_create_inbound_callerdesk_lead(phone: Optional[str]) -> Optional[dict]:
+async def _find_or_create_inbound_callerdesk_lead(phone: Optional[str], organization_id: str) -> Optional[dict]:
     """Match an inbound CallerDesk caller, or create an assigned CRM lead."""
     digits = _phone_digits(phone, last10=True)
     if not digits:
         return None
-    lead = await db.leads.find_one({"phone": {"$regex": f"{re.escape(digits)}$"}}, {"_id": 0})
+    lead = await db.leads.find_one({"phone": {"$regex": f"{re.escape(digits)}$"}, "organization_id": organization_id}, {"_id": 0})
     if lead:
         return lead
-    assignee_id = await _pick_auto_assignee()
+    assignee_id = await _pick_auto_assignee(organization_id)
     now = now_utc().isoformat()
     lead = {
         "id": new_id(), "name": f"Inbound caller {digits}", "phone": digits,
         "source": "manual", "stage": "new", "priority": "warm",
         "assigned_to": assignee_id, "co_assigned_to": [],
+        "organization_id": organization_id,
         "created_at": now, "updated_at": now,
     }
     await db.leads.insert_one(lead)
-    await log_activity(lead["id"], {"name": "CallerDesk"}, "lead_created", "Lead created from unmatched inbound CallerDesk call")
+    await log_activity(lead["id"], {"name": "CallerDesk", "organization_id": organization_id}, "lead_created", "Lead created from unmatched inbound CallerDesk call")
     if assignee_id:
         await create_notification(
             type="lead_assigned", title="New inbound call lead",
@@ -6124,11 +6148,14 @@ async def _schedule_missed_call_retry(lead: Optional[dict], call_sid: Optional[s
     """Create one follow-up per missed provider call; the due-call job dials it."""
     if not lead:
         return
-    settings = await get_integration_settings()
+    organization_id = lead.get("organization_id")
+    if not organization_id:
+        return
+    settings = await get_integration_settings(organization_id)
     if not settings.get("missed_call_followup_enabled", True):
         return
     call_key = call_sid or f"{lead['id']}:{status_text}"
-    if await db.follow_ups.find_one({"lead_id": lead["id"], "meta.source_call_sid": call_key, "status": "pending"}):
+    if await db.follow_ups.find_one({"lead_id": lead["id"], "organization_id": organization_id, "meta.source_call_sid": call_key, "status": "pending"}):
         return
     delay_hours = float(settings.get("missed_call_followup_hours", 1 / 6) or 1 / 6)
     due_at = now_utc() + timedelta(hours=delay_hours)
@@ -6137,6 +6164,7 @@ async def _schedule_missed_call_retry(lead: Optional[dict], call_sid: Optional[s
         "id": new_id(), "lead_id": lead["id"], "due_at": due_at.isoformat(), "kind": "call",
         "notes": f"Automatic retry after CallerDesk {status_text} call", "assigned_to": assignee_id,
         "status": "pending", "created_at": now_utc().isoformat(),
+        "organization_id": organization_id,
         "meta": {"auto": True, "auto_dial": True, "source_call_sid": call_key, "callerdesk_status": status_text},
     })
     for user_id in dict.fromkeys([assignee_id, *(lead.get("co_assigned_to") or [])]):
@@ -6157,7 +6185,8 @@ async def _initiate_callerdesk_call(
     campaign_id: Optional[str] = None,
     campaign_number_id: Optional[str] = None,
 ) -> dict:
-    settings = await get_integration_settings()
+    organization_id = lead.get("organization_id") or actor.get("active_organization_id") or actor.get("organization_id")
+    settings = await get_integration_settings(organization_id)
     if not lead.get("phone"):
         raise HTTPException(status_code=400, detail="Lead has no phone number")
     exec_phone = _phone_digits(actor.get("phone"), last10=True)
@@ -6229,7 +6258,8 @@ async def _initiate_callerdesk_call(
 
 
 async def _initiate_call(lead: dict, actor: dict) -> dict:
-    settings = await get_integration_settings()
+    organization_id = lead.get("organization_id") or actor.get("active_organization_id") or actor.get("organization_id")
+    settings = await get_integration_settings(organization_id)
     provider = (settings.get("calling_provider") or "callerdesk").lower()
     if provider != "callerdesk":
         raise HTTPException(status_code=409, detail="Propzel is configured for CallerDesk only. Select CallerDesk in Settings.")
@@ -6299,7 +6329,7 @@ def _mask_call_row(row: dict, user: dict) -> dict:
 
 @api.get("/callerdesk/status")
 async def callerdesk_status(user: dict = Depends(get_current_user)):
-    settings = await get_integration_settings()
+    settings = await get_integration_settings(organization_scope(user).get("organization_id"))
     configured = _callerdesk_configured(settings)
     virtual_number = settings.get("callerdesk_virtual_number")
     return {
@@ -6316,13 +6346,14 @@ async def callerdesk_status(user: dict = Depends(get_current_user)):
 async def callerdesk_dashboard(user: dict = Depends(require_roles("admin", "manager"))):
     await _expire_old_callerdesk_campaign_calls()
     today_start = datetime(now_utc().year, now_utc().month, now_utc().day, tzinfo=timezone.utc).isoformat()
-    q_today = {"created_at": {"$gte": today_start}}
+    org_scope = organization_scope(user)
+    q_today = {**org_scope, "created_at": {"$gte": today_start}}
     total_calls = await db.callerdesk_calls.count_documents(q_today)
     connected = await db.callerdesk_calls.count_documents({**q_today, "status": {"$in": ["connected", "completed", "answer", "answered"]}})
     dnp = await db.callerdesk_calls.count_documents({**q_today, "status": "dnp"})
     failed = await db.callerdesk_calls.count_documents({**q_today, "status": {"$in": ["failed", "busy"]}})
-    active_campaigns = await db.callerdesk_campaigns.count_documents({"status": "active"})
-    pending_campaign_calls = await db.callerdesk_campaign_numbers.count_documents({"status": {"$in": ["pending", "dialing", "initiated", "ringing", "queued"]}})
+    active_campaigns = await db.callerdesk_campaigns.count_documents({**org_scope, "status": "active"})
+    pending_campaign_calls = await db.callerdesk_campaign_numbers.count_documents({**org_scope, "status": {"$in": ["pending", "dialing", "initiated", "ringing", "queued"]}})
     return {
         "total_calls": total_calls,
         "connected": connected,
@@ -6342,7 +6373,7 @@ async def callerdesk_call_logs(
     search: Optional[str] = None,
     user: dict = Depends(require_roles("admin", "manager")),
 ):
-    q = _callerdesk_filter_query(status_filter, direction, date_from, date_to, search)
+    q = {**organization_scope(user), **_callerdesk_filter_query(status_filter, direction, date_from, date_to, search)}
     rows = await db.callerdesk_calls.find(q).sort("created_at", -1).limit(250).to_list(250)
     return {"items": [_mask_call_row(r, user) for r in rows]}
 
@@ -6356,7 +6387,7 @@ async def callerdesk_campaigns(
     user: dict = Depends(require_roles("admin", "manager")),
 ):
     await _expire_old_callerdesk_campaign_calls()
-    q: dict = {}
+    q: dict = organization_scope(user)
     if status_filter and status_filter != "all":
         q["status"] = status_filter
     if date_from or date_to:
@@ -6380,9 +6411,11 @@ async def callerdesk_campaigns(
 @api.post("/callerdesk/campaigns")
 async def create_callerdesk_campaign(body: CallerDeskCampaignBody, actor: dict = Depends(require_roles("admin", "manager"))):
     lead_ids = list(dict.fromkeys(body.lead_ids or []))
+    org_scope = organization_scope(actor)
+    organization_id = org_scope.get("organization_id")
     leads = []
     if lead_ids:
-        leads = await db.leads.find({"id": {"$in": lead_ids}}, {"_id": 0}).to_list(len(lead_ids))
+        leads = await db.leads.find({"id": {"$in": lead_ids}, **org_scope}, {"_id": 0}).to_list(len(lead_ids))
     numbers = list(dict.fromkeys([n for n in (body.numbers or []) if _phone_digits(n)]))
     for lead in leads:
         if lead.get("phone"):
@@ -6399,6 +6432,7 @@ async def create_callerdesk_campaign(body: CallerDeskCampaignBody, actor: dict =
         "calls_per_minute": max(1, min(int(body.calls_per_minute or 3), 20)),
         "created_by": actor["id"],
         "created_by_name": actor.get("name"),
+        "organization_id": organization_id,
         "created_at": now,
         "updated_at": now,
     }
@@ -6411,6 +6445,7 @@ async def create_callerdesk_campaign(body: CallerDeskCampaignBody, actor: dict =
         docs.append({
             "id": new_id(),
             "campaign_id": cid,
+            "organization_id": organization_id,
             "lead_id": (lead or {}).get("id"),
             "lead_name": (lead or {}).get("name"),
             "phone": digits,
@@ -6514,6 +6549,28 @@ async def callerdesk_campaign_calls(
     return {"items": rows}
 
 
+async def _callerdesk_organization_from_payload(payload: dict) -> Optional[str]:
+    """Resolve an inbound webhook to one organisation by its configured DID."""
+    candidates = {
+        _phone_digits(payload.get(key), last10=True)
+        for key in ("deskphone", "virtual_number", "member_num", "destination_number", "to", "To", "callerid")
+        if payload.get(key)
+    }
+    candidates.discard("")
+    settings = await db.settings.find({"id": {"$regex": "^organization:"}}, {"_id": 0}).to_list(200)
+    matches = [
+        setting.get("organization_id")
+        for setting in settings
+        if _phone_digits(setting.get("callerdesk_virtual_number"), last10=True) in candidates
+    ]
+    matches = [organization_id for organization_id in matches if organization_id]
+    if len(set(matches)) == 1:
+        return matches[0]
+    # A single configured organisation is an unambiguous and safe fallback.
+    configured = [setting.get("organization_id") for setting in settings if setting.get("organization_id") and setting.get("callerdesk_authcode")]
+    return configured[0] if len(configured) == 1 else None
+
+
 @api.post("/callerdesk/webhook")
 async def callerdesk_webhook(request: Request):
     content_type = request.headers.get("content-type") or ""
@@ -6521,7 +6578,10 @@ async def callerdesk_webhook(request: Request):
         payload = await request.json()
     else:
         payload = dict(await request.form())
-    settings = await get_integration_settings()
+    organization_id = await _callerdesk_organization_from_payload(payload)
+    if not organization_id:
+        raise HTTPException(status_code=400, detail="Webhook DID is not mapped to exactly one organisation")
+    settings = await get_integration_settings(organization_id)
     secret = settings.get("callerdesk_webhook_secret")
     if secret and payload.get("secret") != secret and request.headers.get("X-CallerDesk-Secret") != secret:
         return StarletteResponse(status_code=403)
@@ -6533,10 +6593,10 @@ async def callerdesk_webhook(request: Request):
     phone_to = payload.get("member_num") or payload.get("destination_number") or payload.get("to") or payload.get("To")
     recording_url = payload.get("file") or payload.get("recording_url") or payload.get("RecordingUrl")
 
-    call = await db.callerdesk_calls.find_one({"call_sid": call_sid}) if call_sid else None
-    lead = await db.leads.find_one({"id": call.get("lead_id")}, {"_id": 0}) if call and call.get("lead_id") else None
+    call = await db.callerdesk_calls.find_one({"call_sid": call_sid, "organization_id": organization_id}) if call_sid else None
+    lead = await db.leads.find_one({"id": call.get("lead_id"), "organization_id": organization_id}, {"_id": 0}) if call and call.get("lead_id") else None
     if not lead and direction != "outgoing":
-        lead = await _find_or_create_inbound_callerdesk_lead(phone_from)
+        lead = await _find_or_create_inbound_callerdesk_lead(phone_from, organization_id)
     actor = await db.users.find_one({"id": call.get("actor_id")}, {"_id": 0}) if call and call.get("actor_id") else {"name": "CallerDesk"}
     await _save_callerdesk_call(
         lead,
@@ -6557,8 +6617,20 @@ async def callerdesk_webhook(request: Request):
             {"id": call["campaign_number_id"]},
             {"$set": {"status": status_text, "duration_sec": duration, "call_sid": call_sid, "updated_at": now_utc().isoformat()}},
         )
-    if status_text in {"dnp", "busy", "failed"}:
+    if lead and status_text in {"dnp", "busy", "failed", "missed", "no_answer", "not_answered"}:
         await _schedule_missed_call_retry(lead, call_sid, status_text)
+    if lead and status_text in {"ringing", "connected", "completed", "answered"}:
+        recipients = list(dict.fromkeys([lead.get("assigned_to"), *(lead.get("co_assigned_to") or [])]))
+        for recipient in filter(None, recipients):
+            await create_notification(
+                type="incoming_call" if direction != "outgoing" else "call_connected",
+                title="Incoming CallerDesk call" if direction != "outgoing" else "CallerDesk call connected",
+                message=f"{lead.get('name', 'Unknown caller')} · {status_text}",
+                user_id=recipient,
+                link=f"/leads/{lead['id']}",
+                meta={"lead_id": lead["id"], "call_sid": call_sid, "organization_id": organization_id},
+                dedupe_key=f"call-alert:{call_sid}:{recipient}:{status_text}",
+            )
     return {"ok": True}
 
 
@@ -7704,9 +7776,9 @@ async def on_startup():
     except Exception as e:
         log.warning(f"index setup: {e}")
 
-    # Vercel injects the VERCEL env var automatically.
-    # We skip seeding and schedulers on Vercel to prevent cold-start timeouts.
-    if not os.environ.get("VERCEL"):
+    # Production and developer environments must never silently repopulate a
+    # cleaned CRM with sample records.  Demo fixtures are opt-in only.
+    if not os.environ.get("VERCEL") and os.environ.get("SEED_DEMO_DATA", "").lower() == "true":
         await seed_demo()
 
         # Scheduler: EOD email at IST 18:00; notif refresh every 15 minutes
