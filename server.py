@@ -6930,6 +6930,55 @@ class NotificationBody(BaseDoc):
     meta: Optional[dict] = None
 
 
+class PushTokenBody(BaseDoc):
+    token: str
+    platform: Optional[str] = None
+
+
+async def _send_expo_push(tokens: list[str], title: str, message: str, data: Optional[dict] = None) -> None:
+    """Deliver a best-effort Expo push without delaying CRM event processing."""
+    valid = [token for token in dict.fromkeys(tokens) if token.startswith("ExponentPushToken[") or token.startswith("ExpoPushToken[")]
+    if not valid:
+        return
+    payload = [
+        {
+            "to": token,
+            "title": title,
+            "body": message,
+            "sound": "default",
+            "data": data or {},
+        }
+        for token in valid
+    ]
+
+    def _send() -> None:
+        req = urllib.request.Request(
+            "https://exp.host/--/api/v2/push/send",
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json", "Accept": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=15):
+            return
+
+    try:
+        await asyncio.to_thread(_send)
+    except Exception as exc:
+        log.warning("Expo push delivery failed: %s", exc)
+
+
+@api.post("/notifications/push-token")
+async def register_push_token(body: PushTokenBody, user: dict = Depends(get_current_user)):
+    token = body.token.strip()
+    if not (token.startswith("ExponentPushToken[") or token.startswith("ExpoPushToken[")):
+        raise HTTPException(status_code=400, detail="Invalid Expo push token")
+    await db.users.update_one(
+        {"id": user["id"]},
+        {"$addToSet": {"push_tokens": token}, "$set": {"updated_at": now_utc().isoformat()}},
+    )
+    return {"ok": True}
+
+
 async def create_notification(
     *,
     type: str,
@@ -6967,6 +7016,10 @@ async def create_notification(
         "created_at": now_utc().isoformat(),
     }
     await db.notifications.insert_one(doc)
+    if user_id:
+        recipient = await db.users.find_one({"id": user_id}, {"push_tokens": 1, "_id": 0})
+        tokens = (recipient or {}).get("push_tokens") or []
+        await _send_expo_push(tokens, title, message, {"type": type, **(meta or {})})
 
 
 def _notif_scope_filter(user: dict) -> dict:
