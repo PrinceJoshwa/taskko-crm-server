@@ -4217,9 +4217,9 @@ def _with_env_integration_defaults(settings: Optional[dict]) -> dict:
     merged = dict(settings or {})
     defaults = _env_integration_defaults()
     for key, value in defaults.items():
-        # Deployment secrets are authoritative. This prevents a stale value
-        # saved in Settings from overriding the active CallerDesk credential.
-        if key in {"callerdesk_authcode", "callerdesk_webhook_secret"} or not merged.get(key):
+        # Deployment secrets provide defaults, while organisation-specific
+        # settings take precedence for multi-account integrations.
+        if not merged.get(key):
             merged[key] = value
     if defaults.get("evolution_api_url") and defaults.get("evolution_api_key"):
         merged["whatsapp_provider"] = "evolution"
