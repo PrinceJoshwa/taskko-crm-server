@@ -4955,8 +4955,10 @@ async def create_whatsapp_message_for_lead(lead: dict, body: WhatsAppSendBody, a
 
 
 @api.get("/whatsapp/analytics")
-async def whatsapp_analytics(user: dict = Depends(require_roles("admin"))):
-    q = {} if user.get("role") in {"admin", "manager"} else {"assigned_to": user["id"]}
+async def whatsapp_analytics(user: dict = Depends(require_roles("admin", "manager", "executive", "super_admin"))):
+    q = organization_scope(user)
+    if user.get("role") not in {"admin", "manager", "super_admin"}:
+        q["assigned_to"] = user["id"]
     conversations = await db.whatsapp_conversations.find(q, {"id": 1, "_id": 0}).to_list(2000)
     conv_ids = [c["id"] for c in conversations]
     msg_match = {"conversation_id": {"$in": conv_ids}} if conv_ids else {"conversation_id": "__none__"}
@@ -4989,7 +4991,7 @@ async def whatsapp_analytics(user: dict = Depends(require_roles("admin"))):
 
 
 @api.get("/whatsapp/status")
-async def whatsapp_status(user: dict = Depends(require_roles("admin"))):
+async def whatsapp_status(user: dict = Depends(require_roles("admin", "manager", "executive", "super_admin"))):
     settings = await get_integration_settings(organization_scope(user).get("organization_id"))
     configured = bool(settings.get("evolution_api_url") and settings.get("evolution_api_key")) if settings.get("whatsapp_provider") == "evolution" else bool(settings.get("whatsapp_service_url") and settings.get("whatsapp_access_token"))
     return {
@@ -5249,7 +5251,7 @@ async def delete_whatsapp_form(form_id: str, actor: dict = Depends(require_roles
 
 
 @api.post("/whatsapp/messages")
-async def send_whatsapp_message(body: WhatsAppDirectSendBody, actor: dict = Depends(require_roles("admin"))):
+async def send_whatsapp_message(body: WhatsAppDirectSendBody, actor: dict = Depends(require_roles("admin", "manager", "executive", "super_admin"))):
     if not body.text.strip():
         raise HTTPException(status_code=400, detail="Message text is required")
     lead = await require_lead_access(body.lead_id, actor)
@@ -5257,10 +5259,8 @@ async def send_whatsapp_message(body: WhatsAppDirectSendBody, actor: dict = Depe
 
 
 @api.post("/whatsapp/media")
-async def send_whatsapp_media(body: WhatsAppMediaSendBody, actor: dict = Depends(require_roles("admin"))):
-    lead = await db.leads.find_one(scoped_id_query(body.lead_id, actor), {"_id": 0})
-    if not lead:
-        raise HTTPException(status_code=404, detail="Lead not found")
+async def send_whatsapp_media(body: WhatsAppMediaSendBody, actor: dict = Depends(require_roles("admin", "manager", "executive", "super_admin"))):
+    lead = await require_lead_access(body.lead_id, actor)
     conv = await ensure_whatsapp_conversation_for_lead(lead, actor)
     settings = await get_integration_settings(lead.get("organization_id"))
     number = "".join(ch for ch in str(lead.get("phone") or conv.get("contact_phone") or "") if ch.isdigit())
@@ -5333,7 +5333,7 @@ async def bulk_send_whatsapp(body: WhatsAppBulkSendBody, actor: dict = Depends(r
 
 
 @api.get("/whatsapp/conversations")
-async def whatsapp_conversations(user: dict = Depends(require_roles("admin"))):
+async def whatsapp_conversations(user: dict = Depends(require_roles("admin", "manager", "executive", "super_admin"))):
     q = organization_scope(user)
     if user.get("role") not in {"admin", "manager", "super_admin"}: q["assigned_to"] = user["id"]
     docs = await db.whatsapp_conversations.find(q, {"_id": 0}).sort("updated_at", -1).to_list(500)
@@ -5341,11 +5341,11 @@ async def whatsapp_conversations(user: dict = Depends(require_roles("admin"))):
 
 
 @api.get("/whatsapp/conversations/{conversation_id}/messages")
-async def whatsapp_messages(conversation_id: str, user: dict = Depends(require_roles("admin"))):
+async def whatsapp_messages(conversation_id: str, user: dict = Depends(require_roles("admin", "manager", "executive", "super_admin"))):
     conv = await db.whatsapp_conversations.find_one({"id": conversation_id, **organization_scope(user)}, {"_id": 0})
     if not conv:
         raise HTTPException(status_code=404, detail="Conversation not found")
-    if user.get("role") not in {"admin", "manager"} and conv.get("assigned_to") != user.get("id"):
+    if user.get("role") not in {"admin", "manager", "super_admin"} and conv.get("assigned_to") != user.get("id"):
         raise HTTPException(status_code=403, detail="Conversation is not assigned to you")
     return await db.whatsapp_messages.find({"conversation_id": conversation_id, **organization_scope(user)}, {"_id": 0}).sort("created_at", 1).to_list(500)
 
@@ -5355,7 +5355,7 @@ async def send_whatsapp_attachment(
     conversation_id: str,
     file: UploadFile = File(...),
     caption: str = Form(""),
-    actor: dict = Depends(require_roles("admin")),
+    actor: dict = Depends(require_roles("admin", "manager", "executive", "super_admin")),
 ):
     """Send an uploaded attachment through Evolution without storing it on Vercel."""
     conv = await db.whatsapp_conversations.find_one({"id": conversation_id, **organization_scope(actor)}, {"_id": 0})
@@ -5364,6 +5364,7 @@ async def send_whatsapp_attachment(
     lead = await db.leads.find_one({"id": conv.get("lead_id"), **organization_scope(actor)}, {"_id": 0})
     if not lead or not lead.get("phone"):
         raise HTTPException(status_code=400, detail="A linked lead with a phone number is required to send an attachment")
+    await require_lead_access(lead["id"], actor)
     content = await file.read()
     if not content:
         raise HTTPException(status_code=400, detail="Choose a file to attach")
@@ -5475,7 +5476,7 @@ async def whatsapp_webhook(request: Request, organization_id: Optional[str] = No
 
 
 @api.get("/leads/{lead_id}/whatsapp")
-async def lead_whatsapp(lead_id: str, user: dict = Depends(require_roles("admin"))):
+async def lead_whatsapp(lead_id: str, user: dict = Depends(require_roles("admin", "manager", "executive", "super_admin"))):
     lead = await require_lead_access(lead_id, user)
     conv = await ensure_whatsapp_conversation_for_lead(lead, user)
     messages = await db.whatsapp_messages.find({"conversation_id": conv["id"]}, {"_id": 0}).sort("created_at", 1).to_list(500)
@@ -5483,7 +5484,7 @@ async def lead_whatsapp(lead_id: str, user: dict = Depends(require_roles("admin"
 
 
 @api.post("/leads/{lead_id}/whatsapp/messages")
-async def send_lead_whatsapp(lead_id: str, body: WhatsAppSendBody, actor: dict = Depends(require_roles("admin"))):
+async def send_lead_whatsapp(lead_id: str, body: WhatsAppSendBody, actor: dict = Depends(require_roles("admin", "manager", "executive", "super_admin"))):
     if not body.text.strip():
         raise HTTPException(status_code=400, detail="Message text is required")
     lead = await require_lead_access(lead_id, actor)
