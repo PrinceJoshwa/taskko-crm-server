@@ -4628,6 +4628,15 @@ def _whatsapp_webhook_url() -> str:
 
 
 def _extract_whatsapp_phone(payload: dict) -> Optional[str]:
+    # Evolution's canonical messages.upsert shape puts the sender in
+    # data.key.remoteJid. Handle that explicitly before generic envelopes.
+    key = payload.get("key") if isinstance(payload, dict) else None
+    if isinstance(key, dict):
+        raw_remote = key.get("remoteJid") or key.get("remote_jid") or key.get("participant")
+        if raw_remote:
+            digits = "".join(ch for ch in str(raw_remote).split("@", 1)[0].split(":", 1)[0] if ch.isdigit())
+            if digits:
+                return digits
     raw = _first_payload_value(payload, [
         "chat_id", "chatId", "remoteJid", "remote_jid", "jid", "from", "sender",
         "author", "participant", "number", "phone", "contact_phone", "wa_id",
@@ -4640,6 +4649,15 @@ def _extract_whatsapp_phone(payload: dict) -> Optional[str]:
 
 
 def _extract_whatsapp_text(payload: dict) -> str:
+    # Evolution text messages are usually message.conversation or
+    # message.extendedTextMessage.text.
+    message = payload.get("message") if isinstance(payload, dict) else None
+    if isinstance(message, dict):
+        direct = message.get("conversation")
+        extended = message.get("extendedTextMessage")
+        nested = extended.get("text") if isinstance(extended, dict) else None
+        if direct or nested:
+            return str(direct or nested).strip()
     text = _first_payload_value(payload, [
         "text", "conversation", "body", "messageText", "message_text", "caption", "content",
     ])
@@ -4671,11 +4689,14 @@ def _coerce_whatsapp_payload(payload):
 
 
 def _extract_whatsapp_message_id(payload: dict) -> Optional[str]:
+    key = payload.get("key") if isinstance(payload, dict) else None
+    if isinstance(key, dict) and key.get("id"):
+        return str(key["id"])
     return _first_payload_value(payload, ["message_id", "messageId", "wamid", "id"])
 
 
 def _extract_whatsapp_timestamp(payload: dict) -> str:
-    value = _first_payload_value(payload, ["timestamp", "message_timestamp", "messageTimestamp", "sent_at", "sentAt", "time"])
+    value = payload.get("messageTimestamp") if isinstance(payload, dict) and payload.get("messageTimestamp") else _first_payload_value(payload, ["timestamp", "message_timestamp", "messageTimestamp", "sent_at", "sentAt", "time"])
     if not value:
         return now_utc().isoformat()
     try:
@@ -5397,6 +5418,7 @@ async def send_whatsapp_attachment(
 @app.api_route("/webhook/whatsapp/inbound", methods=["POST"])
 @api.api_route("/whatsapp/webhook", methods=["GET", "POST"])
 @api.api_route("/whatsapp/webhook/{organization_id}", methods=["GET", "POST"])
+@api.api_route("/webhook/inbound/{organization_id}", methods=["GET", "POST"])
 async def whatsapp_webhook(request: Request, organization_id: Optional[str] = None):
     if request.method == "GET":
         return {"ok": True}
