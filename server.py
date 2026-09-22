@@ -4368,10 +4368,11 @@ async def get_integration_settings(organization_id: Optional[str] = None) -> dic
         )
     if not settings:
         settings = await db.settings.find_one({"id": "singleton"}, {"_id": 0})
-    merged = dict(settings or {})
-    # Per-organisation integration data overrides legacy settings, but never
-    # crosses the selected organisation boundary.
-    merged.update({key: value for key, value in (integration or {}).items() if value not in (None, "")})
+    # Start with the integration record, then apply the organisation's Settings
+    # values as canonical overrides. This prevents stale integration credentials
+    # from replacing a newly saved CallerDesk auth code or DID.
+    merged = {key: value for key, value in (integration or {}).items() if value not in (None, "")}
+    merged.update(settings or {})
     return _with_env_integration_defaults(merged)
 
 
