@@ -5084,7 +5084,12 @@ async def whatsapp_qrcode(actor: dict = Depends(require_roles("admin"))):
         instance = _evolution_instance(settings)
         if not instance:
             raise HTTPException(status_code=400, detail="Set an Evolution instance name for this organisation")
-        return await evolution_request("GET", f"/instance/connect/{instance}", settings)
+        result = await evolution_request("GET", f"/instance/connect/{instance}", settings)
+        # Evolution returns the scan image as `base64`; preserve the provider
+        # response but expose the existing CRM UI's expected field as well.
+        if isinstance(result, dict) and result.get("base64") and not result.get("qrcode"):
+            result["qrcode"] = result["base64"]
+        return result
     result = await whatsapp_service_request("get_qrcode", settings)
     message = str(result.get("message") or result.get("error") or "") if isinstance(result, dict) else ""
     if re.search(r"instance.?id.*(used|expired|invalid)|already connected|not found", message, re.I):
