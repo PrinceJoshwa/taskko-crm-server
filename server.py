@@ -3006,6 +3006,10 @@ class OrganizationPatchBody(BaseDoc):
     active: Optional[bool] = None
 
 
+class OrganizationSwitchBody(BaseDoc):
+    organization_id: str
+
+
 class OrganizationIntegrationBody(BaseDoc):
     resend_from_email: Optional[EmailStr] = None
     resend_api_key: Optional[str] = None
@@ -3284,6 +3288,16 @@ def _redact_organization_integration(doc: dict) -> dict:
 async def list_organizations(user: dict = Depends(get_current_user)):
     query = {} if user.get("role") == "super_admin" else {"id": user.get("organization_id")}
     return await db.organizations.find(query, {"_id": 0}).sort("name", 1).to_list(100)
+
+
+@api.post("/organizations/switch")
+async def switch_organization(body: OrganizationSwitchBody, user: dict = Depends(require_roles("super_admin"))):
+    """Validate a Super Admin's selected organisation before the UI scopes requests."""
+    organization = await db.organizations.find_one({"id": body.organization_id, "active": {"$ne": False}}, {"_id": 0})
+    if not organization:
+        raise HTTPException(status_code=404, detail="Active organisation not found")
+    await log_activity(None, {**user, "active_organization_id": body.organization_id}, "organization_switched", f"Switched workspace to {organization['name']}", {"organization_id": body.organization_id})
+    return organization
 
 
 @api.post("/organizations")
@@ -4102,7 +4116,7 @@ async def list_activities(lead_id: Optional[str] = None, limit: int = 50, user: 
     elif user.get("role") not in {"admin", "manager"}:
         lead_ids = [
             d["id"]
-            for d in await db.leads.find({"assigned_to": user["id"]}, {"id": 1, "_id": 0}).to_list(2000)
+            for d in await db.leads.find({"assigned_to": user["id"], **organization_scope(user)}, {"id": 1, "_id": 0}).to_list(2000)
         ]
         q["lead_id"] = {"$in": lead_ids} if lead_ids else "__none__"
     docs = await db.activities.find(q, {"_id": 0}).sort("created_at", -1).to_list(limit)
@@ -4360,14 +4374,15 @@ async def log_email(lead_id: str, body: EmailLogBody, actor: dict = Depends(get_
     return {"ok": True}
 
 
-async def _message_campaign_leads(body: MessageCampaignBody) -> list[dict]:
+async def _message_campaign_leads(body: MessageCampaignBody, actor: dict) -> list[dict]:
+    scope = organization_scope(actor)
     lead_ids = list(dict.fromkeys(body.lead_ids or []))
     if body.call_status and body.call_status != "all":
         status = _normalize_call_status(body.call_status)
-        matched_ids = await db.callerdesk_calls.distinct("lead_id", {"status": status})
+        matched_ids = await db.callerdesk_calls.distinct("lead_id", {**scope, "status": status})
         matched_set = {x for x in matched_ids if x}
         lead_ids = [lead_id for lead_id in lead_ids if lead_id in matched_set] if lead_ids else list(matched_set)
-    query = {"id": {"$in": lead_ids}} if lead_ids else {}
+    query = {**scope, "id": {"$in": lead_ids}} if lead_ids else scope
     return await db.leads.find(query, {"_id": 0}).limit(1000).to_list(1000)
 
 
@@ -4381,13 +4396,14 @@ def _message_campaign_recipient_status(channel: str, lead: dict) -> str:
 
 @api.get("/message-campaigns")
 async def list_message_campaigns(user: dict = Depends(require_roles("admin", "manager"))):
-    campaigns = await db.message_campaigns.find({}, {"_id": 0}).sort("created_at", -1).limit(100).to_list(100)
+    scope = organization_scope(user)
+    campaigns = await db.message_campaigns.find(scope, {"_id": 0}).sort("created_at", -1).limit(100).to_list(100)
     for campaign in campaigns:
         cid = campaign["id"]
-        campaign["total"] = await db.message_campaign_recipients.count_documents({"campaign_id": cid})
-        campaign["pending"] = await db.message_campaign_recipients.count_documents({"campaign_id": cid, "status": "pending"})
-        campaign["sent"] = await db.message_campaign_recipients.count_documents({"campaign_id": cid, "status": "sent"})
-        campaign["failed"] = await db.message_campaign_recipients.count_documents({"campaign_id": cid, "status": {"$in": ["failed", "pending_provider"]}})
+        campaign["total"] = await db.message_campaign_recipients.count_documents({"campaign_id": cid, **scope})
+        campaign["pending"] = await db.message_campaign_recipients.count_documents({"campaign_id": cid, **scope, "status": "pending"})
+        campaign["sent"] = await db.message_campaign_recipients.count_documents({"campaign_id": cid, **scope, "status": "sent"})
+        campaign["failed"] = await db.message_campaign_recipients.count_documents({"campaign_id": cid, **scope, "status": {"$in": ["failed", "pending_provider"]}})
     return {"items": campaigns}
 
 
@@ -4397,7 +4413,7 @@ async def create_message_campaign(body: MessageCampaignBody, actor: dict = Depen
         raise HTTPException(status_code=400, detail="Campaign message is required")
     if body.channel == "email" and not body.subject:
         raise HTTPException(status_code=400, detail="Email subject is required")
-    leads = await _message_campaign_leads(body)
+    leads = await _message_campaign_leads(body, actor)
     if not leads:
         raise HTTPException(status_code=400, detail="Select at least one lead or call status")
     now = now_utc().isoformat()
@@ -4411,6 +4427,7 @@ async def create_message_campaign(body: MessageCampaignBody, actor: dict = Depen
         "status": "draft",
         "created_by": actor["id"],
         "created_by_name": actor.get("name"),
+        "organization_id": organization_scope(actor)["organization_id"],
         "created_at": now,
         "updated_at": now,
     }
@@ -4420,6 +4437,7 @@ async def create_message_campaign(body: MessageCampaignBody, actor: dict = Depen
         recipients.append({
             "id": new_id(),
             "campaign_id": campaign["id"],
+            "organization_id": campaign["organization_id"],
             "lead_id": lead["id"],
             "lead_name": lead.get("name"),
             "phone": lead.get("phone"),
@@ -4435,7 +4453,7 @@ async def create_message_campaign(body: MessageCampaignBody, actor: dict = Depen
 
 
 async def _deliver_message_campaign_item(campaign: dict, recipient: dict, actor: dict) -> str:
-    lead = await db.leads.find_one({"id": recipient["lead_id"]}, {"_id": 0})
+    lead = await db.leads.find_one({"id": recipient["lead_id"], "organization_id": campaign["organization_id"]}, {"_id": 0})
     if not lead:
         return "failed"
     channel = campaign["channel"]
@@ -4446,7 +4464,7 @@ async def _deliver_message_campaign_item(campaign: dict, recipient: dict, actor:
         return "sent" if result.get("provider", {}).get("status") not in {"pending_provider", "provider_error", "pending_credentials"} else "pending_provider"
     if not resend or not resend.api_key:
         return "pending_provider"
-    sender = (await get_integration_settings()).get("resend_from_email") or SENDER_EMAIL
+    sender = (await get_integration_settings(campaign["organization_id"])).get("resend_from_email") or SENDER_EMAIL
     await asyncio.to_thread(resend.Emails.send, {"from": sender, "to": [lead["email"]], "subject": campaign["subject"], "html": campaign["message"].replace("\n", "<br>")})
     await log_activity(lead["id"], actor, "email_sent", campaign["subject"], {"campaign_id": campaign["id"]})
     return "sent"
@@ -4454,37 +4472,39 @@ async def _deliver_message_campaign_item(campaign: dict, recipient: dict, actor:
 
 @api.post("/message-campaigns/{campaign_id}/start")
 async def start_message_campaign(campaign_id: str, actor: dict = Depends(require_roles("admin", "manager"))):
-    campaign = await db.message_campaigns.find_one({"id": campaign_id}, {"_id": 0})
+    scope = organization_scope(actor)
+    campaign = await db.message_campaigns.find_one({"id": campaign_id, **scope}, {"_id": 0})
     if not campaign:
         raise HTTPException(status_code=404, detail="Campaign not found")
-    await db.message_campaigns.update_one({"id": campaign_id}, {"$set": {"status": "active", "updated_at": now_utc().isoformat()}})
-    recipients = await db.message_campaign_recipients.find({"campaign_id": campaign_id, "status": "pending"}).limit(1000).to_list(1000)
+    await db.message_campaigns.update_one({"id": campaign_id, **scope}, {"$set": {"status": "active", "updated_at": now_utc().isoformat()}})
+    recipients = await db.message_campaign_recipients.find({"campaign_id": campaign_id, **scope, "status": "pending"}).limit(1000).to_list(1000)
     sent = failed = pending_provider = 0
     for recipient in recipients:
         try:
             status_text = await _deliver_message_campaign_item(campaign, recipient, actor)
         except Exception as exc:
             status_text = "failed"
-            await db.message_campaign_recipients.update_one({"id": recipient["id"]}, {"$set": {"error": str(exc)}})
-        await db.message_campaign_recipients.update_one({"id": recipient["id"]}, {"$set": {"status": status_text, "updated_at": now_utc().isoformat()}})
+            await db.message_campaign_recipients.update_one({"id": recipient["id"], **scope}, {"$set": {"error": str(exc)}})
+        await db.message_campaign_recipients.update_one({"id": recipient["id"], **scope}, {"$set": {"status": status_text, "updated_at": now_utc().isoformat()}})
         if status_text == "sent": sent += 1
         elif status_text == "pending_provider": pending_provider += 1
         else: failed += 1
     final_status = "completed" if not pending_provider else "completed_with_pending_provider"
-    await db.message_campaigns.update_one({"id": campaign_id}, {"$set": {"status": final_status, "updated_at": now_utc().isoformat()}})
+    await db.message_campaigns.update_one({"id": campaign_id, **scope}, {"$set": {"status": final_status, "updated_at": now_utc().isoformat()}})
     return {"sent": sent, "failed": failed, "pending_provider": pending_provider, "status": final_status}
 
 
 @api.post("/message-campaigns/{campaign_id}/pause")
 async def pause_message_campaign(campaign_id: str, actor: dict = Depends(require_roles("admin", "manager"))):
-    await db.message_campaigns.update_one({"id": campaign_id}, {"$set": {"status": "paused", "updated_at": now_utc().isoformat()}})
+    await db.message_campaigns.update_one({"id": campaign_id, **organization_scope(actor)}, {"$set": {"status": "paused", "updated_at": now_utc().isoformat()}})
     return {"ok": True}
 
 
 @api.delete("/message-campaigns/{campaign_id}")
 async def delete_message_campaign(campaign_id: str, actor: dict = Depends(require_roles("admin", "manager"))):
-    await db.message_campaigns.update_one({"id": campaign_id}, {"$set": {"status": "cancelled", "updated_at": now_utc().isoformat()}})
-    await db.message_campaign_recipients.update_many({"campaign_id": campaign_id, "status": "pending"}, {"$set": {"status": "cancelled", "updated_at": now_utc().isoformat()}})
+    scope = organization_scope(actor)
+    await db.message_campaigns.update_one({"id": campaign_id, **scope}, {"$set": {"status": "cancelled", "updated_at": now_utc().isoformat()}})
+    await db.message_campaign_recipients.update_many({"campaign_id": campaign_id, **scope, "status": "pending"}, {"$set": {"status": "cancelled", "updated_at": now_utc().isoformat()}})
     return {"ok": True}
 
 
@@ -4654,6 +4674,8 @@ async def _find_lead_by_phone_digits(phone_digits: str) -> Optional[dict]:
     if not phone_digits:
         return None
     chat_id = whatsapp_chat_id(phone_digits)
+    # Webhook callers must resolve their organisation before this helper is
+    # used.  Interactive operations use scoped lead access instead.
     conv = await db.whatsapp_conversations.find_one({"chat_id": chat_id}, {"_id": 0}) if chat_id else None
     if conv and conv.get("lead_id"):
         return await db.leads.find_one({"id": conv["lead_id"]}, {"_id": 0})
@@ -4747,13 +4769,15 @@ async def ensure_whatsapp_conversation_for_lead(lead: dict, actor: dict) -> dict
     chat_id = whatsapp_chat_id(lead.get("phone"))
     if not chat_id:
         raise HTTPException(status_code=400, detail="Lead has no WhatsApp-capable phone number")
-    existing = await db.whatsapp_conversations.find_one({"lead_id": lead["id"], "chat_id": chat_id}, {"_id": 0})
+    organization_id = lead.get("organization_id") or organization_scope(actor).get("organization_id")
+    existing = await db.whatsapp_conversations.find_one({"lead_id": lead["id"], "chat_id": chat_id, "organization_id": organization_id}, {"_id": 0})
     if existing:
         return existing
     now = now_utc().isoformat()
     doc = {
         "id": new_id(),
         "lead_id": lead["id"],
+        "organization_id": organization_id,
         "chat_id": chat_id,
         "contact_name": lead.get("name"),
         "contact_phone": lead.get("phone"),
@@ -5040,13 +5064,14 @@ async def whatsapp_api_info(user: dict = Depends(require_roles("admin"))):
 
 @api.get("/whatsapp/campaigns")
 async def whatsapp_campaigns(user: dict = Depends(require_roles("admin"))):
-    q = {} if user.get("role") in {"admin", "manager"} else {"created_by": user["id"]}
+    q = organization_scope(user)
+    if user.get("role") not in {"admin", "manager", "super_admin"}: q["created_by"] = user["id"]
     return await db.whatsapp_campaigns.find(q, {"_id": 0}).sort("created_at", -1).to_list(100)
 
 
 @api.get("/whatsapp/autoresponders")
 async def list_whatsapp_autoresponders(user: dict = Depends(require_roles("admin"))):
-    q = {} if user.get("role") in {"admin", "manager"} else {"created_by": user["id"]}
+    q = organization_scope(user)
     return await db.whatsapp_autoresponders.find(q, {"_id": 0}).sort("created_at", -1).to_list(100)
 
 
@@ -5054,7 +5079,7 @@ async def list_whatsapp_autoresponders(user: dict = Depends(require_roles("admin
 async def create_whatsapp_autoresponder(body: WhatsAppRuleBody, actor: dict = Depends(require_roles("admin"))):
     now = now_utc().isoformat()
     doc = body.model_dump()
-    doc.update({"id": new_id(), "sent": 0, "failed": 0, "created_by": actor["id"], "created_at": now, "updated_at": now})
+    doc.update({"id": new_id(), "organization_id": organization_scope(actor)["organization_id"], "sent": 0, "failed": 0, "created_by": actor["id"], "created_at": now, "updated_at": now})
     await db.whatsapp_autoresponders.insert_one(doc)
     clean(doc)
     return doc
@@ -5064,21 +5089,21 @@ async def create_whatsapp_autoresponder(body: WhatsAppRuleBody, actor: dict = De
 async def update_whatsapp_autoresponder(rule_id: str, body: WhatsAppRuleBody, actor: dict = Depends(require_roles("admin"))):
     update = body.model_dump(exclude_none=True)
     update["updated_at"] = now_utc().isoformat()
-    r = await db.whatsapp_autoresponders.update_one({"id": rule_id}, {"$set": update})
+    r = await db.whatsapp_autoresponders.update_one({"id": rule_id, **organization_scope(actor)}, {"$set": update})
     if r.matched_count == 0:
         raise HTTPException(status_code=404, detail="Autoresponder not found")
-    return await db.whatsapp_autoresponders.find_one({"id": rule_id}, {"_id": 0})
+    return await db.whatsapp_autoresponders.find_one({"id": rule_id, **organization_scope(actor)}, {"_id": 0})
 
 
 @api.delete("/whatsapp/autoresponders/{rule_id}")
 async def delete_whatsapp_autoresponder(rule_id: str, actor: dict = Depends(require_roles("admin"))):
-    await db.whatsapp_autoresponders.delete_one({"id": rule_id})
+    await db.whatsapp_autoresponders.delete_one({"id": rule_id, **organization_scope(actor)})
     return {"ok": True}
 
 
 @api.get("/whatsapp/chatbots")
 async def list_whatsapp_chatbots(user: dict = Depends(require_roles("admin"))):
-    q = {} if user.get("role") in {"admin", "manager"} else {"created_by": user["id"]}
+    q = organization_scope(user)
     return await db.whatsapp_chatbots.find(q, {"_id": 0}).sort("created_at", -1).to_list(100)
 
 
@@ -5086,7 +5111,7 @@ async def list_whatsapp_chatbots(user: dict = Depends(require_roles("admin"))):
 async def create_whatsapp_chatbot(body: WhatsAppRuleBody, actor: dict = Depends(require_roles("admin"))):
     now = now_utc().isoformat()
     doc = body.model_dump()
-    doc.update({"id": new_id(), "sent": 0, "failed": 0, "created_by": actor["id"], "created_at": now, "updated_at": now})
+    doc.update({"id": new_id(), "organization_id": organization_scope(actor)["organization_id"], "sent": 0, "failed": 0, "created_by": actor["id"], "created_at": now, "updated_at": now})
     await db.whatsapp_chatbots.insert_one(doc)
     clean(doc)
     return doc
@@ -5096,21 +5121,21 @@ async def create_whatsapp_chatbot(body: WhatsAppRuleBody, actor: dict = Depends(
 async def update_whatsapp_chatbot(bot_id: str, body: WhatsAppRuleBody, actor: dict = Depends(require_roles("admin"))):
     update = body.model_dump(exclude_none=True)
     update["updated_at"] = now_utc().isoformat()
-    r = await db.whatsapp_chatbots.update_one({"id": bot_id}, {"$set": update})
+    r = await db.whatsapp_chatbots.update_one({"id": bot_id, **organization_scope(actor)}, {"$set": update})
     if r.matched_count == 0:
         raise HTTPException(status_code=404, detail="Chatbot not found")
-    return await db.whatsapp_chatbots.find_one({"id": bot_id}, {"_id": 0})
+    return await db.whatsapp_chatbots.find_one({"id": bot_id, **organization_scope(actor)}, {"_id": 0})
 
 
 @api.delete("/whatsapp/chatbots/{bot_id}")
 async def delete_whatsapp_chatbot(bot_id: str, actor: dict = Depends(require_roles("admin"))):
-    await db.whatsapp_chatbots.delete_one({"id": bot_id})
+    await db.whatsapp_chatbots.delete_one({"id": bot_id, **organization_scope(actor)})
     return {"ok": True}
 
 
 @api.get("/whatsapp/forms")
 async def list_whatsapp_forms(user: dict = Depends(require_roles("admin"))):
-    q = {} if user.get("role") in {"admin", "manager"} else {"created_by": user["id"]}
+    q = organization_scope(user)
     docs = await db.whatsapp_forms.find(q, {"_id": 0}).sort("created_at", -1).to_list(100)
     for d in docs:
         d["webhook_url"] = f"/api/integrations/whatsapp/forms/{d['id']}"
@@ -5121,7 +5146,7 @@ async def list_whatsapp_forms(user: dict = Depends(require_roles("admin"))):
 async def create_whatsapp_form(body: WhatsAppFormBody, actor: dict = Depends(require_roles("admin"))):
     now = now_utc().isoformat()
     doc = body.model_dump()
-    doc.update({"id": new_id(), "fields": doc.get("fields") or ["name", "phone", "email"], "created_by": actor["id"], "created_at": now, "updated_at": now})
+    doc.update({"id": new_id(), "organization_id": organization_scope(actor)["organization_id"], "fields": doc.get("fields") or ["name", "phone", "email"], "created_by": actor["id"], "created_at": now, "updated_at": now})
     await db.whatsapp_forms.insert_one(doc)
     clean(doc)
     doc["webhook_url"] = f"/api/integrations/whatsapp/forms/{doc['id']}"
@@ -5130,7 +5155,7 @@ async def create_whatsapp_form(body: WhatsAppFormBody, actor: dict = Depends(req
 
 @api.delete("/whatsapp/forms/{form_id}")
 async def delete_whatsapp_form(form_id: str, actor: dict = Depends(require_roles("admin"))):
-    await db.whatsapp_forms.delete_one({"id": form_id})
+    await db.whatsapp_forms.delete_one({"id": form_id, **organization_scope(actor)})
     return {"ok": True}
 
 
@@ -5144,11 +5169,11 @@ async def send_whatsapp_message(body: WhatsAppDirectSendBody, actor: dict = Depe
 
 @api.post("/whatsapp/media")
 async def send_whatsapp_media(body: WhatsAppMediaSendBody, actor: dict = Depends(require_roles("admin"))):
-    lead = await db.leads.find_one({"id": body.lead_id}, {"_id": 0})
+    lead = await db.leads.find_one(scoped_id_query(body.lead_id, actor), {"_id": 0})
     if not lead:
         raise HTTPException(status_code=404, detail="Lead not found")
     conv = await ensure_whatsapp_conversation_for_lead(lead, actor)
-    settings = await get_integration_settings()
+    settings = await get_integration_settings(lead.get("organization_id"))
     number = "".join(ch for ch in str(lead.get("phone") or conv.get("contact_phone") or "") if ch.isdigit())
     instance_id = settings.get("marketly_instance_id") or settings.get("whatsapp_instance_id")
     payload = {"instance_id": instance_id, "to": number, "media_url": body.media_url}
@@ -5159,14 +5184,14 @@ async def send_whatsapp_media(body: WhatsAppMediaSendBody, actor: dict = Depends
     )
     now = now_utc().isoformat()
     msg = {
-        "id": new_id(), "conversation_id": conv["id"], "lead_id": lead["id"],
+        "id": new_id(), "organization_id": lead.get("organization_id"), "conversation_id": conv["id"], "lead_id": lead["id"],
         "direction": "outgoing", "sender_id": actor.get("id"), "sender_name": actor.get("name"),
         "message_type": body.media_type, "text": body.caption or "", "media_url": body.media_url,
         "filename": body.filename, "provider_status": provider.get("status"),
         "provider_response": provider, "created_at": now,
     }
     await db.whatsapp_messages.insert_one(msg)
-    await db.whatsapp_conversations.update_one({"id": conv["id"]}, {"$set": {"last_message": body.caption or f"[{body.media_type}]", "last_message_at": now, "updated_at": now}})
+    await db.whatsapp_conversations.update_one({"id": conv["id"], "organization_id": lead.get("organization_id")}, {"$set": {"last_message": body.caption or f"[{body.media_type}]", "last_message_at": now, "updated_at": now}})
     clean(msg)
     return {"ok": True, "message": msg, "provider": provider, "conversation_id": conv["id"]}
 
@@ -5200,6 +5225,7 @@ async def bulk_send_whatsapp(body: WhatsAppBulkSendBody, actor: dict = Depends(r
         "pending": 0,
         "status": "completed" if failed == 0 else "completed_with_errors",
         "created_by": actor["id"],
+        "organization_id": organization_scope(actor)["organization_id"],
         "created_at": started_at,
         "updated_at": now_utc().isoformat(),
     }
@@ -5209,19 +5235,20 @@ async def bulk_send_whatsapp(body: WhatsAppBulkSendBody, actor: dict = Depends(r
 
 @api.get("/whatsapp/conversations")
 async def whatsapp_conversations(user: dict = Depends(require_roles("admin"))):
-    q = {} if user.get("role") in {"admin", "manager"} else {"assigned_to": user["id"]}
+    q = organization_scope(user)
+    if user.get("role") not in {"admin", "manager", "super_admin"}: q["assigned_to"] = user["id"]
     docs = await db.whatsapp_conversations.find(q, {"_id": 0}).sort("updated_at", -1).to_list(500)
     return [sanitize_whatsapp_conversation(d, user) for d in docs]
 
 
 @api.get("/whatsapp/conversations/{conversation_id}/messages")
 async def whatsapp_messages(conversation_id: str, user: dict = Depends(require_roles("admin"))):
-    conv = await db.whatsapp_conversations.find_one({"id": conversation_id}, {"_id": 0})
+    conv = await db.whatsapp_conversations.find_one({"id": conversation_id, **organization_scope(user)}, {"_id": 0})
     if not conv:
         raise HTTPException(status_code=404, detail="Conversation not found")
     if user.get("role") not in {"admin", "manager"} and conv.get("assigned_to") != user.get("id"):
         raise HTTPException(status_code=403, detail="Conversation is not assigned to you")
-    return await db.whatsapp_messages.find({"conversation_id": conversation_id}, {"_id": 0}).sort("created_at", 1).to_list(500)
+    return await db.whatsapp_messages.find({"conversation_id": conversation_id, **organization_scope(user)}, {"_id": 0}).sort("created_at", 1).to_list(500)
 
 
 @app.api_route("/webhook/whatsapp/inbound", methods=["POST"])
@@ -5351,11 +5378,25 @@ class ImportRow(BaseDoc):
     configuration: Optional[str] = None
     location_pref: Optional[str] = None
     notes: Optional[str] = None
+    lead_date: Optional[str] = None
 
 
 class ImportBody(BaseDoc):
     rows: List[ImportRow]
     auto_assign: bool = True
+
+
+def _parse_imported_date(value: Optional[str]) -> Optional[str]:
+    """Normalize common CSV date formats without rejecting an entire upload."""
+    raw = (value or "").strip()
+    if not raw:
+        return None
+    for fmt in ("%Y-%m-%d", "%d-%m-%Y", "%d/%m/%Y", "%d-%b-%y", "%d-%b-%Y", "%m/%d/%Y"):
+        try:
+            return datetime.strptime(raw, fmt).date().isoformat()
+        except ValueError:
+            continue
+    return None
 
 
 @api.post("/leads/import")
@@ -5364,37 +5405,57 @@ async def import_leads(body: ImportBody, actor: dict = Depends(require_roles("ad
     if not organization_id:
         raise HTTPException(status_code=400, detail="Select an organisation before importing leads")
     projects = {p["name"].lower(): p["id"] async for p in db.projects.find({"organization_id": organization_id}, {"id": 1, "name": 1})}
+    # Resolve assignment once and distribute rows in memory.  The previous
+    # implementation queried all lead counts for every row, which times out on
+    # ordinary multi-thousand-row CRM imports.
+    assignees: list[str] = []
+    if body.auto_assign:
+        executives = await db.users.find({"organization_id": organization_id, "role": {"$in": ["executive", "sales"]}, "active": {"$ne": False}}, {"id": 1, "_id": 0}).to_list(500)
+        counts = await asyncio.gather(*[
+            db.leads.count_documents({"organization_id": organization_id, "assigned_to": executive["id"], "stage": {"$nin": ["booked", "lost"]}})
+            for executive in executives
+        ])
+        assignees = [item[1] for item in sorted(zip(counts, [executive["id"] for executive in executives]))]
+
+    now = now_utc().isoformat()
+    docs, activities, date_warnings = [], [], []
+    for index, row in enumerate(body.rows, start=1):
+        imported_date = _parse_imported_date(row.lead_date)
+        if row.lead_date and not imported_date and len(date_warnings) < 20:
+            date_warnings.append({"row": index, "date": row.lead_date, "reason": "Unrecognized date format"})
+        doc = {
+            "id": new_id(), "organization_id": organization_id, "name": row.name.strip(),
+            "phone": row.phone, "email": row.email,
+            "source": row.source if row.source in ("magicbricks", "99acres", "commonfloor", "housing", "website", "jagathi_website", "google_ads", "facebook", "instagram", "referral", "walk_in", "manual") else "manual",
+            "project_id": projects.get((row.project_name or "").strip().lower()),
+            "budget_min": row.budget_min, "budget_max": row.budget_max,
+            "configuration": row.configuration, "location_pref": row.location_pref,
+            "notes": row.notes, "lead_date": imported_date, "stage": "new",
+            "priority": "warm", "stars": 0, "created_at": now, "updated_at": now,
+        }
+        if assignees:
+            doc["assigned_to"] = assignees[(index - 1) % len(assignees)]
+        docs.append(doc)
+        activities.append({"id": new_id(), "lead_id": doc["id"], "actor_id": actor["id"], "actor_name": actor.get("name"), "kind": "lead_created", "message": "Imported via CSV", "meta": {"imported": True}, "organization_id": organization_id, "created_at": now})
+
     created, failed = 0, 0
-    for row in body.rows:
+    # Keep requests and Mongo writes bounded for Vercel/serverless execution.
+    for start in range(0, len(docs), 100):
+        batch = docs[start:start + 100]
         try:
-            pid = projects.get((row.project_name or "").lower())
-            doc = {
-                "id": new_id(),
-                "organization_id": organization_id,
-                "name": row.name,
-                "phone": row.phone,
-                "email": row.email,
-                "source": row.source if row.source in ("magicbricks", "99acres", "commonfloor", "housing", "website", "jagathi_website", "google_ads", "facebook", "instagram", "referral", "walk_in", "manual") else "manual",
-                "project_id": pid,
-                "budget_min": row.budget_min,
-                "budget_max": row.budget_max,
-                "configuration": row.configuration,
-                "location_pref": row.location_pref,
-                "notes": row.notes,
-                "stage": "new",
-                "priority": "warm",
-                "stars": 0,
-                "created_at": now_utc().isoformat(),
-                "updated_at": now_utc().isoformat(),
-            }
-            if body.auto_assign:
-                doc["assigned_to"] = await _pick_auto_assignee(organization_id)
-            await db.leads.insert_one(doc)
-            await log_activity(doc["id"], actor, "lead_created", "Imported via CSV")
-            created += 1
-        except Exception:
-            failed += 1
-    return {"created": created, "failed": failed}
+            await db.leads.insert_many(batch, ordered=False)
+            created += len(batch)
+        except Exception as exc:
+            log.warning("CSV import batch failed for organisation %s: %s", organization_id, exc)
+            failed += len(batch)
+            continue
+        # Importing leads is the primary transaction. Audit insertion must not
+        # turn a successful import into an apparent failure for the user.
+        try:
+            await db.activities.insert_many(activities[start:start + 100], ordered=False)
+        except Exception as exc:
+            log.warning("CSV import activity logging failed for organisation %s: %s", organization_id, exc)
+    return {"created": created, "failed": failed, "date_warnings": date_warnings}
 
 
 # ---------------------------------------------------------------------------
@@ -5866,7 +5927,7 @@ async def report_daily(start: Optional[str] = None, end: Optional[str] = None, u
 async def report_user_status(start: Optional[str] = None, end: Optional[str] = None, date_field: str = "created", user: dict = Depends(get_current_user)):
     _, _, match = await _report_context(start, end, date_field, user)
     leads = await db.leads.find(match, {"_id": 0}).to_list(20000)
-    users = {u["id"]: u.get("name", u["id"]) for u in await db.users.find({}, {"_id": 0, "id": 1, "name": 1}).to_list(500)}
+    users = {u["id"]: u.get("name", u["id"]) for u in await db.users.find({"organization_id": organization_scope(user).get("organization_id")}, {"_id": 0, "id": 1, "name": 1}).to_list(500)}
     stages = ["new", "contacted", "contacted_dnp", "qualified", "qualified_dnp", "site_visit", "site_visit_dnp", "negotiation", "negotiation_dnp", "booked", "lost"]
     grouped = {}
     for lead in leads:
@@ -5885,13 +5946,14 @@ async def report_not_interested(start: Optional[str] = None, end: Optional[str] 
 
 @api.get("/reports/executives")
 async def report_executives(user: dict = Depends(get_current_user)):
-    execs = await db.users.find({"role": "executive"}, {"_id": 0, "password_hash": 0}).to_list(100)
+    scope = organization_scope(user)
+    execs = await db.users.find({"role": "executive", "organization_id": scope.get("organization_id")}, {"_id": 0, "password_hash": 0}).to_list(100)
     rows = []
     for e in execs:
-        total = await db.leads.count_documents({"assigned_to": e["id"]})
-        booked = await db.leads.count_documents({"assigned_to": e["id"], "stage": "booked"})
-        site_visits = await db.site_visits.count_documents({"assigned_to": e["id"]})
-        pending = await db.follow_ups.count_documents({"assigned_to": e["id"], "status": "pending"})
+        total = await db.leads.count_documents({"assigned_to": e["id"], **scope})
+        booked = await db.leads.count_documents({"assigned_to": e["id"], **scope, "stage": "booked"})
+        site_visits = await db.site_visits.count_documents({"assigned_to": e["id"], **scope})
+        pending = await db.follow_ups.count_documents({"assigned_to": e["id"], **scope, "status": "pending"})
         conv = round((booked / total * 100), 1) if total else 0
         rows.append({
             "id": e["id"], "name": e["name"], "email": e["email"],
@@ -6432,6 +6494,7 @@ async def create_callerdesk_campaign(body: CallerDeskCampaignBody, actor: dict =
         "calls_per_minute": max(1, min(int(body.calls_per_minute or 3), 20)),
         "created_by": actor["id"],
         "created_by_name": actor.get("name"),
+        "organization_id": organization_scope(actor)["organization_id"],
         "organization_id": organization_id,
         "created_at": now,
         "updated_at": now,
@@ -6463,62 +6526,65 @@ async def create_callerdesk_campaign(body: CallerDeskCampaignBody, actor: dict =
 
 @api.patch("/callerdesk/campaigns/{campaign_id}")
 async def update_callerdesk_campaign(campaign_id: str, body: CallerDeskCampaignPatchBody, actor: dict = Depends(require_roles("admin", "manager"))):
+    scope = organization_scope(actor)
     update = body.model_dump(exclude_none=True)
     if update:
         update["updated_at"] = now_utc().isoformat()
-        await db.callerdesk_campaigns.update_one({"id": campaign_id}, {"$set": update})
-    doc = await db.callerdesk_campaigns.find_one({"id": campaign_id}, {"_id": 0})
+        await db.callerdesk_campaigns.update_one({"id": campaign_id, **scope}, {"$set": update})
+    doc = await db.callerdesk_campaigns.find_one({"id": campaign_id, **scope}, {"_id": 0})
     if not doc:
         raise HTTPException(status_code=404, detail="Campaign not found")
     return doc
 
 
 async def _run_callerdesk_campaign_batch(campaign_id: str, actor: dict) -> dict:
-    campaign = await db.callerdesk_campaigns.find_one({"id": campaign_id})
+    scope = organization_scope(actor)
+    campaign = await db.callerdesk_campaigns.find_one({"id": campaign_id, **scope})
     if not campaign:
         raise HTTPException(status_code=404, detail="Campaign not found")
     await _expire_old_callerdesk_campaign_calls(campaign_id)
     limit = max(1, min(int(campaign.get("calls_per_minute") or 3), 20))
-    items = await db.callerdesk_campaign_numbers.find({"campaign_id": campaign_id, "status": "pending"}).limit(limit).to_list(limit)
+    items = await db.callerdesk_campaign_numbers.find({"campaign_id": campaign_id, **scope, "status": "pending"}).limit(limit).to_list(limit)
     started = 0
     for item in items:
-        lead = await db.leads.find_one({"id": item.get("lead_id")}, {"_id": 0}) if item.get("lead_id") else None
+        lead = await db.leads.find_one({"id": item.get("lead_id"), **scope}, {"_id": 0}) if item.get("lead_id") else None
         lead = lead or {"id": None, "name": item.get("phone"), "phone": item.get("phone")}
         try:
             result = await _initiate_callerdesk_call(lead, actor, campaign_id=campaign_id, campaign_number_id=item["id"])
             status_text = _normalize_call_status(result.get("status") or "initiated")
             await db.callerdesk_campaign_numbers.update_one(
-                {"id": item["id"]},
+                {"id": item["id"], **scope},
                 {"$set": {"status": status_text, "call_sid": result.get("call_sid"), "last_attempted_at": now_utc().isoformat(), "updated_at": now_utc().isoformat()}, "$inc": {"attempts": 1}},
             )
             started += 1
         except Exception as e:
             await db.callerdesk_campaign_numbers.update_one(
-                {"id": item["id"]},
+                {"id": item["id"], **scope},
                 {"$set": {"status": "failed", "notes": str(e), "updated_at": now_utc().isoformat()}, "$inc": {"attempts": 1}},
             )
-    pending = await db.callerdesk_campaign_numbers.count_documents({"campaign_id": campaign_id, "status": "pending"})
+    pending = await db.callerdesk_campaign_numbers.count_documents({"campaign_id": campaign_id, **scope, "status": "pending"})
     new_status = "completed" if pending == 0 else "active"
-    await db.callerdesk_campaigns.update_one({"id": campaign_id}, {"$set": {"status": new_status, "updated_at": now_utc().isoformat()}})
+    await db.callerdesk_campaigns.update_one({"id": campaign_id, **scope}, {"$set": {"status": new_status, "updated_at": now_utc().isoformat()}})
     return {"started": started, "pending": pending, "status": new_status}
 
 
 @api.post("/callerdesk/campaigns/{campaign_id}/start")
 async def start_callerdesk_campaign(campaign_id: str, actor: dict = Depends(require_roles("admin", "manager"))):
-    await db.callerdesk_campaigns.update_one({"id": campaign_id}, {"$set": {"status": "active", "updated_at": now_utc().isoformat()}})
+    await db.callerdesk_campaigns.update_one({"id": campaign_id, **organization_scope(actor)}, {"$set": {"status": "active", "updated_at": now_utc().isoformat()}})
     return await _run_callerdesk_campaign_batch(campaign_id, actor)
 
 
 @api.post("/callerdesk/campaigns/{campaign_id}/pause")
 async def pause_callerdesk_campaign(campaign_id: str, actor: dict = Depends(require_roles("admin", "manager"))):
-    await db.callerdesk_campaigns.update_one({"id": campaign_id}, {"$set": {"status": "paused", "updated_at": now_utc().isoformat()}})
+    await db.callerdesk_campaigns.update_one({"id": campaign_id, **organization_scope(actor)}, {"$set": {"status": "paused", "updated_at": now_utc().isoformat()}})
     return {"ok": True}
 
 
 @api.delete("/callerdesk/campaigns/{campaign_id}")
 async def delete_callerdesk_campaign(campaign_id: str, actor: dict = Depends(require_roles("admin", "manager"))):
-    await db.callerdesk_campaigns.update_one({"id": campaign_id}, {"$set": {"status": "cancelled", "updated_at": now_utc().isoformat()}})
-    await db.callerdesk_campaign_numbers.update_many({"campaign_id": campaign_id, "status": "pending"}, {"$set": {"status": "cancelled", "updated_at": now_utc().isoformat()}})
+    scope = organization_scope(actor)
+    await db.callerdesk_campaigns.update_one({"id": campaign_id, **scope}, {"$set": {"status": "cancelled", "updated_at": now_utc().isoformat()}})
+    await db.callerdesk_campaign_numbers.update_many({"campaign_id": campaign_id, **scope, "status": "pending"}, {"$set": {"status": "cancelled", "updated_at": now_utc().isoformat()}})
     return {"ok": True}
 
 
@@ -6532,7 +6598,7 @@ async def callerdesk_campaign_calls(
     user: dict = Depends(require_roles("admin", "manager")),
 ):
     await _expire_old_callerdesk_campaign_calls(campaign_id)
-    q: dict = {"campaign_id": campaign_id}
+    q: dict = {"campaign_id": campaign_id, **organization_scope(user)}
     if status_filter and status_filter != "all":
         q["status"] = status_filter
     if search:
@@ -6992,12 +7058,17 @@ async def create_notification(
 ) -> None:
     """Insert a notification. If dedupe_key given, skip if one already exists
     for the same target and key in the last 24h."""
+    organization_id = (meta or {}).get("organization_id")
+    if not organization_id and user_id:
+        recipient_org = await db.users.find_one({"id": user_id}, {"organization_id": 1, "_id": 0})
+        organization_id = (recipient_org or {}).get("organization_id")
     if dedupe_key:
         since = (now_utc() - timedelta(hours=24)).isoformat()
         exists = await db.notifications.find_one({
             "dedupe_key": dedupe_key,
             "user_id": user_id,
             "role_scope": role_scope,
+            "organization_id": organization_id,
             "created_at": {"$gte": since},
         })
         if exists:
@@ -7006,6 +7077,7 @@ async def create_notification(
         "id": new_id(),
         "user_id": user_id,
         "role_scope": role_scope,
+        "organization_id": organization_id,
         "type": type,
         "title": title,
         "message": message,
@@ -7033,7 +7105,7 @@ def _notif_scope_filter(user: dict) -> dict:
     ors: list = [{"user_id": user["id"]}]
     if scopes:
         ors.append({"role_scope": {"$in": scopes}})
-    return {"$or": ors}
+    return {"$and": [organization_scope(user), {"$or": ors}]}
 
 
 @api.get("/notifications")
