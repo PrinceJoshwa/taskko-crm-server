@@ -5154,20 +5154,20 @@ async def whatsapp_api_info(user: dict = Depends(require_roles("admin"))):
 
 
 @api.get("/whatsapp/campaigns")
-async def whatsapp_campaigns(user: dict = Depends(require_roles("admin"))):
+async def whatsapp_campaigns(user: dict = Depends(require_roles("admin", "manager", "executive", "super_admin"))):
     q = organization_scope(user)
     if user.get("role") not in {"admin", "manager", "super_admin"}: q["created_by"] = user["id"]
     return await db.whatsapp_campaigns.find(q, {"_id": 0}).sort("created_at", -1).to_list(100)
 
 
 @api.get("/whatsapp/autoresponders")
-async def list_whatsapp_autoresponders(user: dict = Depends(require_roles("admin"))):
+async def list_whatsapp_autoresponders(user: dict = Depends(require_roles("admin", "manager", "executive", "super_admin"))):
     q = organization_scope(user)
     return await db.whatsapp_autoresponders.find(q, {"_id": 0}).sort("created_at", -1).to_list(100)
 
 
 @api.post("/whatsapp/autoresponders")
-async def create_whatsapp_autoresponder(body: WhatsAppRuleBody, actor: dict = Depends(require_roles("admin"))):
+async def create_whatsapp_autoresponder(body: WhatsAppRuleBody, actor: dict = Depends(require_roles("admin", "manager", "executive", "super_admin"))):
     now = now_utc().isoformat()
     doc = body.model_dump()
     doc.update({"id": new_id(), "organization_id": organization_scope(actor)["organization_id"], "sent": 0, "failed": 0, "created_by": actor["id"], "created_at": now, "updated_at": now})
@@ -5177,7 +5177,7 @@ async def create_whatsapp_autoresponder(body: WhatsAppRuleBody, actor: dict = De
 
 
 @api.patch("/whatsapp/autoresponders/{rule_id}")
-async def update_whatsapp_autoresponder(rule_id: str, body: WhatsAppRuleBody, actor: dict = Depends(require_roles("admin"))):
+async def update_whatsapp_autoresponder(rule_id: str, body: WhatsAppRuleBody, actor: dict = Depends(require_roles("admin", "manager", "executive", "super_admin"))):
     update = body.model_dump(exclude_none=True)
     update["updated_at"] = now_utc().isoformat()
     r = await db.whatsapp_autoresponders.update_one({"id": rule_id, **organization_scope(actor)}, {"$set": update})
@@ -5187,19 +5187,19 @@ async def update_whatsapp_autoresponder(rule_id: str, body: WhatsAppRuleBody, ac
 
 
 @api.delete("/whatsapp/autoresponders/{rule_id}")
-async def delete_whatsapp_autoresponder(rule_id: str, actor: dict = Depends(require_roles("admin"))):
+async def delete_whatsapp_autoresponder(rule_id: str, actor: dict = Depends(require_roles("admin", "manager", "executive", "super_admin"))):
     await db.whatsapp_autoresponders.delete_one({"id": rule_id, **organization_scope(actor)})
     return {"ok": True}
 
 
 @api.get("/whatsapp/chatbots")
-async def list_whatsapp_chatbots(user: dict = Depends(require_roles("admin"))):
+async def list_whatsapp_chatbots(user: dict = Depends(require_roles("admin", "manager", "executive", "super_admin"))):
     q = organization_scope(user)
     return await db.whatsapp_chatbots.find(q, {"_id": 0}).sort("created_at", -1).to_list(100)
 
 
 @api.post("/whatsapp/chatbots")
-async def create_whatsapp_chatbot(body: WhatsAppRuleBody, actor: dict = Depends(require_roles("admin"))):
+async def create_whatsapp_chatbot(body: WhatsAppRuleBody, actor: dict = Depends(require_roles("admin", "manager", "executive", "super_admin"))):
     now = now_utc().isoformat()
     doc = body.model_dump()
     doc.update({"id": new_id(), "organization_id": organization_scope(actor)["organization_id"], "sent": 0, "failed": 0, "created_by": actor["id"], "created_at": now, "updated_at": now})
@@ -5209,7 +5209,7 @@ async def create_whatsapp_chatbot(body: WhatsAppRuleBody, actor: dict = Depends(
 
 
 @api.patch("/whatsapp/chatbots/{bot_id}")
-async def update_whatsapp_chatbot(bot_id: str, body: WhatsAppRuleBody, actor: dict = Depends(require_roles("admin"))):
+async def update_whatsapp_chatbot(bot_id: str, body: WhatsAppRuleBody, actor: dict = Depends(require_roles("admin", "manager", "executive", "super_admin"))):
     update = body.model_dump(exclude_none=True)
     update["updated_at"] = now_utc().isoformat()
     r = await db.whatsapp_chatbots.update_one({"id": bot_id, **organization_scope(actor)}, {"$set": update})
@@ -5219,13 +5219,13 @@ async def update_whatsapp_chatbot(bot_id: str, body: WhatsAppRuleBody, actor: di
 
 
 @api.delete("/whatsapp/chatbots/{bot_id}")
-async def delete_whatsapp_chatbot(bot_id: str, actor: dict = Depends(require_roles("admin"))):
+async def delete_whatsapp_chatbot(bot_id: str, actor: dict = Depends(require_roles("admin", "manager", "executive", "super_admin"))):
     await db.whatsapp_chatbots.delete_one({"id": bot_id, **organization_scope(actor)})
     return {"ok": True}
 
 
 @api.get("/whatsapp/forms")
-async def list_whatsapp_forms(user: dict = Depends(require_roles("admin"))):
+async def list_whatsapp_forms(user: dict = Depends(require_roles("admin", "manager", "executive", "super_admin"))):
     q = organization_scope(user)
     docs = await db.whatsapp_forms.find(q, {"_id": 0}).sort("created_at", -1).to_list(100)
     for d in docs:
@@ -5234,7 +5234,7 @@ async def list_whatsapp_forms(user: dict = Depends(require_roles("admin"))):
 
 
 @api.post("/whatsapp/forms")
-async def create_whatsapp_form(body: WhatsAppFormBody, actor: dict = Depends(require_roles("admin"))):
+async def create_whatsapp_form(body: WhatsAppFormBody, actor: dict = Depends(require_roles("admin", "manager", "executive", "super_admin"))):
     now = now_utc().isoformat()
     doc = body.model_dump()
     doc.update({"id": new_id(), "organization_id": organization_scope(actor)["organization_id"], "fields": doc.get("fields") or ["name", "phone", "email"], "created_by": actor["id"], "created_at": now, "updated_at": now})
@@ -5245,7 +5245,7 @@ async def create_whatsapp_form(body: WhatsAppFormBody, actor: dict = Depends(req
 
 
 @api.delete("/whatsapp/forms/{form_id}")
-async def delete_whatsapp_form(form_id: str, actor: dict = Depends(require_roles("admin"))):
+async def delete_whatsapp_form(form_id: str, actor: dict = Depends(require_roles("admin", "manager", "executive", "super_admin"))):
     await db.whatsapp_forms.delete_one({"id": form_id, **organization_scope(actor)})
     return {"ok": True}
 
@@ -5296,7 +5296,7 @@ async def send_whatsapp_media(body: WhatsAppMediaSendBody, actor: dict = Depends
 
 
 @api.post("/whatsapp/bulk-send")
-async def bulk_send_whatsapp(body: WhatsAppBulkSendBody, actor: dict = Depends(require_roles("admin"))):
+async def bulk_send_whatsapp(body: WhatsAppBulkSendBody, actor: dict = Depends(require_roles("admin", "manager", "executive", "super_admin"))):
     if not body.lead_ids:
         raise HTTPException(status_code=400, detail="Select at least one lead")
     if not body.text.strip():
@@ -5621,13 +5621,13 @@ class WATemplateBody(BaseDoc):
 
 
 @api.get("/whatsapp-templates")
-async def list_wa_templates(user: dict = Depends(require_roles("admin"))):
+async def list_wa_templates(user: dict = Depends(require_roles("admin", "manager", "executive", "super_admin"))):
     docs = await db.whatsapp_templates.find(organization_scope(user), {"_id": 0}).sort("created_at", -1).to_list(500)
     return docs
 
 
 @api.post("/whatsapp-templates")
-async def create_wa_template(body: WATemplateBody, actor: dict = Depends(require_roles("admin"))):
+async def create_wa_template(body: WATemplateBody, actor: dict = Depends(require_roles("admin", "manager", "executive", "super_admin"))):
     doc = body.model_dump()
     doc["id"] = new_id()
     doc["organization_id"] = organization_scope(actor).get("organization_id")
@@ -5638,7 +5638,7 @@ async def create_wa_template(body: WATemplateBody, actor: dict = Depends(require
 
 
 @api.patch("/whatsapp-templates/{tid}")
-async def update_wa_template(tid: str, body: WATemplateBody, actor: dict = Depends(require_roles("admin"))):
+async def update_wa_template(tid: str, body: WATemplateBody, actor: dict = Depends(require_roles("admin", "manager", "executive", "super_admin"))):
     r = await db.whatsapp_templates.update_one(scoped_id_query(tid, actor), {"$set": body.model_dump(exclude_none=True)})
     if r.matched_count == 0:
         raise HTTPException(status_code=404, detail="Template not found")
@@ -5646,7 +5646,7 @@ async def update_wa_template(tid: str, body: WATemplateBody, actor: dict = Depen
 
 
 @api.delete("/whatsapp-templates/{tid}")
-async def delete_wa_template(tid: str, actor: dict = Depends(require_roles("admin"))):
+async def delete_wa_template(tid: str, actor: dict = Depends(require_roles("admin", "manager", "executive", "super_admin"))):
     result = await db.whatsapp_templates.delete_one(scoped_id_query(tid, actor))
     if not result.deleted_count:
         raise HTTPException(status_code=404, detail="Template not found")
