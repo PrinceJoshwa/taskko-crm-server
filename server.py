@@ -4287,6 +4287,17 @@ async def update_settings(body: SettingsBody, actor: dict = Depends(require_role
     if not organization_id:
         raise HTTPException(status_code=400, detail="Select an organisation before updating settings")
     settings_id = f"organization:{organization_id}"
+    # Secret fields are redacted from the settings response. Preserve the
+    # stored value when a form submits the redacted field as blank.
+    secret_fields = {
+        "callerdesk_authcode",
+        "callerdesk_webhook_secret",
+        "whatsapp_access_token",
+        "google_calendar_credentials_json",
+    }
+    for key in secret_fields:
+        if key in update and not str(update[key] or "").strip():
+            update.pop(key)
     update.update({"id": settings_id, "organization_id": organization_id, "updated_at": now_utc().isoformat()})
     await db.settings.update_one({"id": settings_id}, {"$set": update}, upsert=True)
     s = await db.settings.find_one({"id": settings_id}, {"_id": 0})
