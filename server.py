@@ -4226,6 +4226,11 @@ def _with_env_integration_defaults(settings: Optional[dict]) -> dict:
         merged.setdefault("whatsapp_enabled", True)
     elif defaults.get("whatsapp_service_url") and defaults.get("whatsapp_access_token"):
         merged.setdefault("whatsapp_enabled", True)
+    # CallerDesk is the active calling provider whenever its deployment
+    # credentials are present. Older organisation settings may still contain
+    # the placeholder value "pending", which otherwise blocks every call.
+    if defaults.get("callerdesk_authcode") and defaults.get("callerdesk_virtual_number") and merged.get("calling_provider") in (None, "", "pending"):
+        merged["calling_provider"] = "callerdesk"
     if not merged.get("callerdesk_base_url"):
         merged["callerdesk_base_url"] = "https://app.callerdesk.io/api"
     return merged
@@ -7013,7 +7018,7 @@ async def twilio_status(user: dict = Depends(get_current_user)):
 
 @api.get("/calling/status")
 async def calling_status(user: dict = Depends(get_current_user)):
-    settings = await get_integration_settings()
+    settings = await get_integration_settings(organization_scope(user).get("organization_id"))
     provider = "callerdesk"
     from_number = settings.get("callerdesk_virtual_number")
     configured = _callerdesk_configured(settings)
