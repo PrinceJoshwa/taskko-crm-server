@@ -1,8 +1,0 @@
-{
-  "crons": [
-    {
-      "path": "/api/jobs/process-due-call-followups",
-      "schedule": "*/1 * * * *"
-    }
-  ]
-}
