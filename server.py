@@ -2693,6 +2693,7 @@ import secrets
 import uuid
 import random
 import asyncio
+import base64
 import json
 import urllib.parse
 import urllib.request
@@ -2704,7 +2705,7 @@ import bcrypt
 import jwt
 from google.oauth2 import service_account
 from googleapiclient.discovery import build as google_build
-from fastapi import FastAPI, APIRouter, Depends, HTTPException, Request, Response, status, Query
+from fastapi import FastAPI, APIRouter, Depends, HTTPException, Request, Response, status, Query, UploadFile, File, Form
 from starlette.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
 from pydantic import BaseModel, Field, EmailStr, ConfigDict
@@ -2869,7 +2870,7 @@ PHONE_META_KEYS = {
 
 
 def sanitize_phone_fields(doc: dict, user: dict) -> dict:
-    if not doc or user.get("role") in {"admin", "super_admin"}:
+    if not doc or user.get("role") == "super_admin":
         return doc
     sanitized = dict(doc)
     for field in PHONE_FIELDS:
@@ -2884,7 +2885,7 @@ def sanitize_many(docs: list[dict], user: dict) -> list[dict]:
 
 
 def sanitize_phone_meta(value, user: dict, key: Optional[str] = None):
-    if user.get("role") in {"admin", "super_admin"}:
+    if user.get("role") == "super_admin":
         return value
     normalized_key = key.lower() if key else None
     if isinstance(value, dict):
@@ -2908,7 +2909,7 @@ def sanitize_contact_doc(doc: dict, user: dict) -> dict:
     if not doc:
         return doc
     clean(doc)
-    if user.get("role") in {"admin", "super_admin"}:
+    if user.get("role") == "super_admin":
         return doc
     sanitized = dict(doc)
     if sanitized.get("phone"):
@@ -4262,7 +4263,7 @@ async def get_settings(user: dict = Depends(get_current_user)):
         }
         await db.settings.insert_one(s.copy())
     s = _with_env_integration_defaults(s)
-    if user.get("role") not in {"admin", "super_admin"}:
+    if user.get("role") != "super_admin":
         if s.get("whatsapp_number"):
             s["whatsapp_number"] = mask_phone(s["whatsapp_number"])
         s.pop("google_calendar_credentials_json", None)
@@ -4779,7 +4780,7 @@ async def whatsapp_service_request(endpoint: str, settings: dict, params: Option
 
 def sanitize_whatsapp_conversation(doc: dict, user: dict) -> dict:
     clean(doc)
-    if user.get("role") == "admin":
+    if user.get("role") == "super_admin":
         return doc
     if doc.get("contact_phone"):
         doc["contact_phone"] = mask_phone(doc["contact_phone"])
@@ -4994,8 +4995,8 @@ async def whatsapp_status(user: dict = Depends(require_roles("admin"))):
     return {
         "configured": configured,
         "provider": settings.get("whatsapp_provider") or "pending",
-        "instance_id": _evolution_instance(settings) if user.get("role") == "admin" else None,
-        "service_url": settings.get("evolution_api_url") if user.get("role") == "admin" and settings.get("whatsapp_provider") == "evolution" else settings.get("whatsapp_service_url") if user.get("role") == "admin" else None,
+        "instance_id": _evolution_instance(settings) if user.get("role") == "super_admin" else None,
+        "service_url": settings.get("evolution_api_url") if user.get("role") == "super_admin" and settings.get("whatsapp_provider") == "evolution" else settings.get("whatsapp_service_url") if user.get("role") == "super_admin" else None,
         "reference": {
             "session_runtime": "evolution-api",
             "connect_routes": ["/instance/create", "/instance/connect/{instance}", "/webhook/set/{instance}"],
@@ -5056,10 +5057,10 @@ async def whatsapp_profile(user: dict = Depends(require_roles("admin"))):
         "configured": bool(settings.get("evolution_api_url") and settings.get("evolution_api_key")) if settings.get("whatsapp_provider") == "evolution" else bool(settings.get("whatsapp_service_url") and settings.get("whatsapp_access_token")),
         "phone": settings.get("whatsapp_number"),
         "instance_id": _evolution_instance(settings),
-        "service_url": settings.get("evolution_api_url") if user.get("role") == "admin" and settings.get("whatsapp_provider") == "evolution" else settings.get("whatsapp_service_url") if user.get("role") == "admin" else None,
+        "service_url": settings.get("evolution_api_url") if user.get("role") == "super_admin" and settings.get("whatsapp_provider") == "evolution" else settings.get("whatsapp_service_url") if user.get("role") == "super_admin" else None,
         "provider_response": provider,
     }
-    if user.get("role") != "admin":
+    if user.get("role") != "super_admin":
         profile["phone"] = mask_phone(profile.get("phone"))
         profile["instance_id"] = None
     return profile
@@ -5130,8 +5131,8 @@ async def whatsapp_api_info(user: dict = Depends(require_roles("admin"))):
     settings = await get_integration_settings()
     return {
         "configured": bool(settings.get("whatsapp_service_url") and settings.get("whatsapp_access_token")),
-        "base_url": settings.get("whatsapp_service_url") if user.get("role") == "admin" else None,
-        "instance_id": settings.get("whatsapp_instance_id") if user.get("role") == "admin" else None,
+        "base_url": settings.get("whatsapp_service_url") if user.get("role") == "super_admin" else None,
+        "instance_id": settings.get("whatsapp_instance_id") if user.get("role") == "super_admin" else None,
         "endpoints": [
             {"method": "POST", "path": "/create_instance", "purpose": "Create a new WhatsApp instance ID"},
             {"method": "POST", "path": "/get_qrcode", "purpose": "Return QR code for WhatsApp Web login"},
@@ -5347,6 +5348,49 @@ async def whatsapp_messages(conversation_id: str, user: dict = Depends(require_r
     if user.get("role") not in {"admin", "manager"} and conv.get("assigned_to") != user.get("id"):
         raise HTTPException(status_code=403, detail="Conversation is not assigned to you")
     return await db.whatsapp_messages.find({"conversation_id": conversation_id, **organization_scope(user)}, {"_id": 0}).sort("created_at", 1).to_list(500)
+
+
+@api.post("/whatsapp/conversations/{conversation_id}/attachments")
+async def send_whatsapp_attachment(
+    conversation_id: str,
+    file: UploadFile = File(...),
+    caption: str = Form(""),
+    actor: dict = Depends(require_roles("admin")),
+):
+    """Send an uploaded attachment through Evolution without storing it on Vercel."""
+    conv = await db.whatsapp_conversations.find_one({"id": conversation_id, **organization_scope(actor)}, {"_id": 0})
+    if not conv:
+        raise HTTPException(status_code=404, detail="Conversation not found")
+    lead = await db.leads.find_one({"id": conv.get("lead_id"), **organization_scope(actor)}, {"_id": 0})
+    if not lead or not lead.get("phone"):
+        raise HTTPException(status_code=400, detail="A linked lead with a phone number is required to send an attachment")
+    content = await file.read()
+    if not content:
+        raise HTTPException(status_code=400, detail="Choose a file to attach")
+    if len(content) > 16 * 1024 * 1024:
+        raise HTTPException(status_code=413, detail="Attachments must be 16 MB or smaller")
+    settings = await get_integration_settings(lead.get("organization_id"))
+    if settings.get("whatsapp_provider") != "evolution":
+        raise HTTPException(status_code=400, detail="Attachments require the Evolution WhatsApp integration")
+    instance = _evolution_instance(settings)
+    if not instance:
+        raise HTTPException(status_code=400, detail="Set an Evolution instance name for this organisation")
+    filename = file.filename or "attachment"
+    mime = (file.content_type or "application/octet-stream").split(";", 1)[0]
+    number = "".join(ch for ch in str(lead.get("phone")) if ch.isdigit())
+    encoded = base64.b64encode(content).decode("ascii")
+    if mime.startswith("audio/"):
+        provider = await evolution_request("POST", f"/message/sendWhatsAppAudio/{instance}", settings, {"number": number, "audio": encoded})
+        message_type = "audio"
+    else:
+        message_type = "image" if mime.startswith("image/") else "video" if mime.startswith("video/") else "document"
+        provider = await evolution_request("POST", f"/message/sendMedia/{instance}", settings, {"number": number, "mediatype": message_type, "mimetype": mime, "media": encoded, "fileName": filename, "filename": filename, "caption": caption.strip()})
+    now = now_utc().isoformat()
+    message = {"id": new_id(), "organization_id": lead.get("organization_id"), "conversation_id": conversation_id, "lead_id": lead["id"], "direction": "outgoing", "sender_id": actor["id"], "sender_name": actor.get("name"), "message_type": message_type, "text": caption.strip(), "filename": filename, "mimetype": mime, "provider_status": provider.get("status"), "provider_response": provider, "created_at": now}
+    await db.whatsapp_messages.insert_one(message)
+    await db.whatsapp_conversations.update_one({"id": conversation_id, "organization_id": lead.get("organization_id")}, {"$set": {"last_message": caption.strip() or f"[{filename}]", "last_message_at": now, "updated_at": now}})
+    clean(message)
+    return {"ok": True, "message": message, "provider": provider}
 
 
 @app.api_route("/webhook/whatsapp/inbound", methods=["POST"])
@@ -6489,7 +6533,7 @@ def _callerdesk_filter_query(
 
 def _mask_call_row(row: dict, user: dict) -> dict:
     row.pop("_id", None)
-    if user.get("role") != "admin":
+    if user.get("role") != "super_admin":
         row["phone_from"] = mask_phone(row.get("phone_from"))
         row["phone_to"] = mask_phone(row.get("phone_to"))
     return row
@@ -6504,7 +6548,7 @@ async def callerdesk_status(user: dict = Depends(get_current_user)):
         "provider": (settings.get("calling_provider") or "pending").lower(),
         "configured": configured,
         "base_url": settings.get("callerdesk_base_url") or "https://app.callerdesk.io/api",
-        "virtual_number": virtual_number if user.get("role") == "admin" else mask_phone(virtual_number),
+        "virtual_number": virtual_number if user.get("role") == "super_admin" else mask_phone(virtual_number),
         "webhook_url": f"{BACKEND_PUBLIC_URL.rstrip('/')}/api/callerdesk/webhook" if BACKEND_PUBLIC_URL else "/api/callerdesk/webhook",
         "status": "configured" if configured else "pending_credentials",
     }
@@ -6715,7 +6759,7 @@ async def callerdesk_campaign_calls(
         if date_from: q["created_at"]["$gte"] = date_from
         if date_to: q["created_at"]["$lte"] = f"{date_to}T23:59:59.999999+00:00" if len(date_to) == 10 else date_to
     rows = await db.callerdesk_campaign_numbers.find(q, {"_id": 0}).sort("created_at", -1).limit(500).to_list(500)
-    if user.get("role") != "admin":
+    if user.get("role") != "super_admin":
         for row in rows:
             row["phone"] = mask_phone(row.get("phone"))
     return {"items": rows}
@@ -6953,7 +6997,7 @@ async def calling_status(user: dict = Depends(get_current_user)):
     return {
         "provider": provider,
         "configured": configured,
-        "from_number": from_number if user.get("role") == "admin" else mask_phone(from_number),
+        "from_number": from_number if user.get("role") == "super_admin" else mask_phone(from_number),
         "webhook_base": BACKEND_PUBLIC_URL,
         "status": "configured" if configured else "pending_credentials",
     }
