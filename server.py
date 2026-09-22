@@ -5009,7 +5009,7 @@ async def whatsapp_status(user: dict = Depends(require_roles("admin", "manager",
 
 
 @api.post("/whatsapp/connect")
-async def whatsapp_connect(actor: dict = Depends(require_roles("admin"))):
+async def whatsapp_connect(actor: dict = Depends(require_roles("admin", "manager", "executive", "super_admin"))):
     organization_id = organization_scope(actor).get("organization_id")
     settings = await get_integration_settings(organization_id)
     if settings.get("whatsapp_provider") == "evolution":
@@ -5051,7 +5051,7 @@ async def whatsapp_connect(actor: dict = Depends(require_roles("admin"))):
 
 
 @api.get("/whatsapp/profile")
-async def whatsapp_profile(user: dict = Depends(require_roles("admin"))):
+async def whatsapp_profile(user: dict = Depends(require_roles("admin", "manager", "executive", "super_admin"))):
     settings = await get_integration_settings(organization_scope(user).get("organization_id"))
     provider = await evolution_request("GET", f"/instance/connectionState/{_evolution_instance(settings)}", settings) if settings.get("whatsapp_provider") == "evolution" and _evolution_instance(settings) else await whatsapp_service_request("instance", settings)
     profile = {
@@ -5069,7 +5069,7 @@ async def whatsapp_profile(user: dict = Depends(require_roles("admin"))):
 
 
 @api.post("/whatsapp/pairing-code")
-async def whatsapp_pairing_code(body: WhatsAppPairingCodeBody, actor: dict = Depends(require_roles("admin"))):
+async def whatsapp_pairing_code(body: WhatsAppPairingCodeBody, actor: dict = Depends(require_roles("admin", "manager", "executive", "super_admin"))):
     settings = await get_integration_settings()
     if not body.phone.strip():
         raise HTTPException(status_code=400, detail="Phone number is required")
@@ -5081,7 +5081,7 @@ async def whatsapp_pairing_code(body: WhatsAppPairingCodeBody, actor: dict = Dep
 
 
 @api.get("/whatsapp/qrcode")
-async def whatsapp_qrcode(actor: dict = Depends(require_roles("admin"))):
+async def whatsapp_qrcode(actor: dict = Depends(require_roles("admin", "manager", "executive", "super_admin"))):
     settings = await get_integration_settings(organization_scope(actor).get("organization_id"))
     if settings.get("whatsapp_provider") == "evolution":
         instance = _evolution_instance(settings)
@@ -5120,7 +5120,7 @@ async def whatsapp_qrcode(actor: dict = Depends(require_roles("admin"))):
 
 
 @api.post("/whatsapp/disconnect")
-async def whatsapp_disconnect(actor: dict = Depends(require_roles("admin"))):
+async def whatsapp_disconnect(actor: dict = Depends(require_roles("admin", "manager", "executive", "super_admin"))):
     settings = await get_integration_settings(organization_scope(actor).get("organization_id"))
     if settings.get("whatsapp_provider") == "evolution":
         instance = _evolution_instance(settings)
@@ -5129,7 +5129,7 @@ async def whatsapp_disconnect(actor: dict = Depends(require_roles("admin"))):
 
 
 @api.get("/whatsapp/api")
-async def whatsapp_api_info(user: dict = Depends(require_roles("admin"))):
+async def whatsapp_api_info(user: dict = Depends(require_roles("admin", "manager", "executive", "super_admin"))):
     settings = await get_integration_settings()
     return {
         "configured": bool(settings.get("whatsapp_service_url") and settings.get("whatsapp_access_token")),
