@@ -2909,7 +2909,7 @@ def sanitize_contact_doc(doc: dict, user: dict) -> dict:
     if not doc:
         return doc
     clean(doc)
-    if user.get("role") == "super_admin":
+    if user.get("role") == "super_admin" or doc.get("id") == user.get("id"):
         return doc
     sanitized = dict(doc)
     if sanitized.get("phone"):
