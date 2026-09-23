@@ -4217,9 +4217,10 @@ def _with_env_integration_defaults(settings: Optional[dict]) -> dict:
     merged = dict(settings or {})
     defaults = _env_integration_defaults()
     for key, value in defaults.items():
-        # Deployment secrets provide defaults, while organisation-specific
-        # settings take precedence for multi-account integrations.
-        if not merged.get(key):
+        # The current rollout uses one shared CallerDesk account. Its Vercel
+        # credentials must override stale per-organisation values until each
+        # organisation has its own confirmed CallerDesk account configuration.
+        if key in {"callerdesk_authcode", "callerdesk_virtual_number"} or not merged.get(key):
             merged[key] = value
     if defaults.get("evolution_api_url") and defaults.get("evolution_api_key"):
         merged["whatsapp_provider"] = "evolution"
