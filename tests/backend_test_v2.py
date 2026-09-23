@@ -283,10 +283,8 @@ class TestReports:
         assert r.status_code == 200
         rows = r.json()
         assert isinstance(rows, list)
-        assert len(rows) >= 3  # 3 seeded executives
-        for row in rows:
-            for k in ["id", "name", "email", "leads", "booked", "site_visits", "pending_followups", "conversion"]:
-                assert k in row
+        # Only Super Admin is allowed to see the organisation-wide user report.
+        assert rows == []
 
     def test_source_report(self, admin_session):
         r = admin_session.get(f"{API}/reports/sources")

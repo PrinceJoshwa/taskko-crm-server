@@ -217,7 +217,11 @@ class TestInventoryExport:
         assert "text/csv" in ct, f"content-type was {ct}"
         text = r.text
         first_line = text.split("\n")[0]
-        expected = "tower,floor,unit_no,config,carpet_area,price,facing,status"
+        me = admin_s.get(f"{API}/auth/me").json()
+        orgs = admin_s.get(f"{API}/organizations").json()
+        organization = next((org for org in orgs if org.get("id") == me.get("organization_id")), {})
+        jagathi = "jagat" in f"{organization.get('name', '')} {organization.get('slug', '')}".lower()
+        expected = "tower,floor,unit_no,config,carpet_area," + ("built_up_area," if jagathi else "") + "price,facing,status"
         assert first_line.strip() == expected, f"header wrong: {first_line!r}"
 
     def test_executive_export_ok(self, priya_s, some_project_id):
@@ -234,7 +238,7 @@ class TestInventoryImport:
         tower_tag = f"TESTC{uuid.uuid4().hex[:4].upper()}"
         rows = [
             {"tower": tower_tag, "floor": 1, "unit_no": f"{tower_tag}-0101",
-             "config": "3BHK", "carpet_area": 1200, "price": 15000000,
+             "config": "3BHK", "carpet_area": 1200, "built_up_area": 1400, "price": 15000000,
              "facing": "East", "status": "available"},
             {"tower": tower_tag, "floor": 2, "unit_no": f"{tower_tag}-0201",
              "config": "3BHK", "carpet_area": 1250, "price": 16000000,
@@ -252,6 +256,15 @@ class TestInventoryImport:
         units = admin_s.get(f"{API}/units", params={"project_id": some_project_id}).json()
         matching = [u for u in units if u["tower"] == tower_tag]
         assert len(matching) == 2
+        projects = admin_s.get(f"{API}/projects").json()
+        project = next(p for p in projects if p["id"] == some_project_id)
+        assert all(u.get("organization_id") == project.get("organization_id") for u in matching)
+        organizations = admin_s.get(f"{API}/organizations").json()
+        organization = next((org for org in organizations if org.get("id") == project.get("organization_id")), {})
+        if "jagat" in f"{organization.get('name', '')} {organization.get('slug', '')}".lower():
+            assert matching[0].get("built_up_area") == 1400
+        else:
+            assert "built_up_area" not in matching[0]
         # cleanup
         for u in matching:
             admin_s.delete(f"{API}/units/{u['id']}")
