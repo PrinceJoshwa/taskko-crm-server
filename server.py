@@ -3827,7 +3827,10 @@ async def co_assign_lead(lead_id: str, body: CoAssignBody, actor: dict = Depends
 
 
 @api.post("/leads/{lead_id}/stage")
-async def move_stage(lead_id: str, body: StageBody, actor: dict = Depends(require_roles("admin", "manager"))):
+async def move_stage(lead_id: str, body: StageBody, actor: dict = Depends(get_current_user)):
+    # Executives may move only leads already visible to them. Admins and
+    # managers retain organisation-wide stage management access.
+    await require_lead_access(lead_id, actor)
     update = {"stage": body.stage, "updated_at": now_utc().isoformat()}
     if body.stage == "lost" and body.note:
         update["lost_reason"] = body.note
@@ -6176,6 +6179,50 @@ async def report_activity(start: Optional[str] = None, end: Optional[str] = None
         item["avg_duration_sec"] = round(item["total_duration_sec"] / item["outgoing_calls"], 1) if item["outgoing_calls"] else 0
         out.append(item)
     return sorted(out, key=lambda x: (-x["outgoing_calls"], x["user"]))
+
+
+@api.get("/reports/calls")
+async def report_calls(
+    call_type: Literal["missed", "outgoing"] = "outgoing",
+    start: Optional[str] = None,
+    end: Optional[str] = None,
+    date_field: str = "created",
+    assigned_to: Optional[str] = None,
+    user: dict = Depends(get_current_user),
+):
+    """Return the call rows behind the report counters, with the same scope."""
+    start_dt, end_dt, lead_match = await _report_context(start, end, date_field, user, assigned_to=assigned_to)
+    activity_match = {**organization_scope(user), "created_at": {"$gte": start_dt.isoformat(), "$lte": end_dt.isoformat()}}
+    if user.get("role") != "super_admin":
+        activity_match["$or"] = [{"actor_id": user["id"]}, {"user_id": user["id"]}]
+    lead_ids = None
+    if user.get("role") != "super_admin" or assigned_to and assigned_to != "all":
+        lead_ids = [lead["id"] for lead in await db.leads.find(lead_match, {"_id": 0, "id": 1}).to_list(20000)]
+        activity_match["lead_id"] = {"$in": lead_ids} if lead_ids else "__none__"
+    rows = await db.activities.find(activity_match, {"_id": 0}).sort("created_at", -1).to_list(20000)
+    calls = []
+    for row in rows:
+        kind = row.get("kind", "")
+        meta = row.get("meta") or {}
+        is_outgoing = kind in {"outgoing_call", "call", "missed_call"} and meta.get("direction", "outgoing") == "outgoing"
+        is_missed = kind == "missed_call" or meta.get("disposition") in {"missed", "no_answer", "busy", "failed", "not_answered"}
+        if (call_type == "missed" and not (is_outgoing and is_missed)) or (call_type == "outgoing" and not is_outgoing):
+            continue
+        calls.append(row)
+    lead_ids = list({row.get("lead_id") for row in calls if row.get("lead_id")})
+    leads = {lead["id"]: sanitize_phone_fields(lead, user) for lead in await db.leads.find({"id": {"$in": lead_ids}, **organization_scope(user)}, {"_id": 0}).to_list(len(lead_ids) or 1)}
+    users = {person["id"]: person.get("name", person["id"]) for person in await db.users.find({"organization_id": organization_scope(user).get("organization_id")}, {"_id": 0, "id": 1, "name": 1}).to_list(500)}
+    return [{
+        "id": row.get("id"),
+        "lead_id": row.get("lead_id"),
+        "lead_name": (leads.get(row.get("lead_id")) or {}).get("name", "Unknown lead"),
+        "phone": (leads.get(row.get("lead_id")) or {}).get("phone"),
+        "user": users.get(row.get("actor_id") or row.get("user_id"), row.get("actor_name", "Unassigned")),
+        "status": (row.get("meta") or {}).get("disposition") or row.get("kind"),
+        "duration_sec": int((row.get("meta") or {}).get("duration_sec") or 0),
+        "created_at": row.get("created_at"),
+        "call_sid": (row.get("meta") or {}).get("call_sid"),
+    } for row in calls]
 
 
 @api.get("/reports/daily")
