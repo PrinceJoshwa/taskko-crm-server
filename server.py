@@ -4959,7 +4959,7 @@ def _evolution_connection_state(response: dict) -> str:
     return str(raw_state or (response.get("state") if isinstance(response, dict) else "") or "unknown").lower()
 
 
-async def evolution_request(method: str, path: str, settings: dict, payload: Optional[dict] = None, timeout: int = 30) -> dict:
+async def evolution_request(method: str, path: str, settings: dict, payload: Optional[dict] = None, timeout: int = 90) -> dict:
     """Call Evolution API from the backend without ever returning its API key."""
     base_url = str(settings.get("evolution_api_url") or "").rstrip("/")
     api_key = settings.get("evolution_api_key")
@@ -4987,7 +4987,18 @@ async def evolution_request(method: str, path: str, settings: dict, payload: Opt
         return result
     except urllib.error.HTTPError as exc:
         raw = exc.read().decode("utf-8", errors="replace")[:500]
-        return {"status": "provider_error", "http_status": exc.code, "message": "Evolution API request failed", "provider_response": raw}
+        try:
+            provider_response = json.loads(raw) if raw else {}
+        except json.JSONDecodeError:
+            provider_response = raw
+        detail = provider_response.get("message") if isinstance(provider_response, dict) else None
+        detail = detail or provider_response.get("error") if isinstance(provider_response, dict) else detail
+        return {
+            "status": "provider_error",
+            "http_status": exc.code,
+            "message": f"Evolution API returned HTTP {exc.code}" + (f": {detail}" if detail else ""),
+            "provider_response": provider_response,
+        }
     except Exception as exc:
         log.warning("Evolution API request failed for %s: %s", path, exc)
         return {"status": "provider_error", "message": str(exc)}
@@ -4999,7 +5010,7 @@ async def forward_whatsapp_message(settings: dict, lead: dict, conversation: dic
         instance = _evolution_instance(settings)
         if not instance:
             return {"status": "pending_credentials", "message": "Set an Evolution instance name for this organisation"}
-        return await evolution_request("POST", f"/message/sendText/{instance}", settings, {"number": number, "text": text, "delay": 0, "linkPreview": True})
+        return await evolution_request("POST", f"/message/sendText/{instance}", settings, {"number": number, "text": text, "delay": 0, "linkPreview": True}, timeout=90)
     bearer = settings.get("marketly_bearer_token")
     marketly_instance = settings.get("marketly_instance_id") or settings.get("whatsapp_instance_id")
     if bearer and marketly_instance:
@@ -5022,6 +5033,8 @@ async def create_whatsapp_message_for_lead(lead: dict, body: WhatsAppSendBody, a
     conv = await ensure_whatsapp_conversation_for_lead(lead, actor)
     now = now_utc().isoformat()
     provider_result = await forward_whatsapp_message(await whatsapp_settings_for_actor(lead.get("organization_id"), actor), lead, conv, body.text)
+    if provider_result.get("status") in {"provider_error", "pending_credentials"}:
+        raise HTTPException(status_code=502, detail=provider_result.get("message") or "Evolution API could not send the message")
     msg = {
         "id": new_id(),
         "conversation_id": conv["id"],
@@ -5466,11 +5479,11 @@ async def _send_whatsapp_attachment(conv: dict, lead: dict, file: UploadFile, ca
     number = "".join(ch for ch in str(lead.get("phone")) if ch.isdigit())
     encoded = base64.b64encode(content).decode("ascii")
     if mime.startswith("audio/"):
-        provider = await evolution_request("POST", f"/message/sendWhatsAppAudio/{instance}", settings, {"number": number, "audio": encoded})
+        provider = await evolution_request("POST", f"/message/sendWhatsAppAudio/{instance}", settings, {"number": number, "audio": encoded}, timeout=90)
         message_type = "audio"
     else:
         message_type = "image" if mime.startswith("image/") else "video" if mime.startswith("video/") else "document"
-        provider = await evolution_request("POST", f"/message/sendMedia/{instance}", settings, {"number": number, "mediatype": message_type, "mimetype": mime, "media": encoded, "fileName": filename, "filename": filename, "caption": caption.strip()})
+        provider = await evolution_request("POST", f"/message/sendMedia/{instance}", settings, {"number": number, "mediatype": message_type, "mimetype": mime, "media": encoded, "fileName": filename, "filename": filename, "caption": caption.strip()}, timeout=90)
     if provider.get("status") in {"provider_error", "pending_credentials"}:
         raise HTTPException(status_code=502, detail=provider.get("message") or "WhatsApp provider could not send the attachment")
     now = now_utc().isoformat()
