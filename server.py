@@ -3276,6 +3276,19 @@ def organization_scope(user: dict) -> dict:
     raise HTTPException(status_code=403, detail="Your account is not assigned to an organisation")
 
 
+def has_company_wide_access(user: dict) -> bool:
+    """Only workspace administrators may view organisation-wide metrics."""
+    return user.get("role") in {"admin", "super_admin"}
+
+
+def activity_scope_for(user: dict) -> dict:
+    """Keep activity metrics tied to the actor for non-administrator dashboards."""
+    scope = organization_scope(user)
+    if not has_company_wide_access(user):
+        scope["$or"] = [{"actor_id": user["id"]}, {"user_id": user["id"]}]
+    return scope
+
+
 def scoped_id_query(record_id: str, user: dict) -> dict:
     return {"id": record_id, **organization_scope(user)}
 
@@ -4163,8 +4176,11 @@ async def analytics_summary(project_id: Optional[str] = None, user: dict = Depen
     match: dict = organization_scope(user)
     if project_id:
         match["project_id"] = project_id
-    if user["role"] in {"executive", "sales"}:
+    if not has_company_wide_access(user):
         match["assigned_to"] = user["id"]
+    work_scope = organization_scope(user)
+    if not has_company_wide_access(user):
+        work_scope["assigned_to"] = user["id"]
 
     today_start = datetime.combine(now_utc().date(), datetime.min.time()).replace(tzinfo=timezone.utc).isoformat()
     today_end = datetime.combine(now_utc().date(), datetime.max.time()).replace(tzinfo=timezone.utc).isoformat()
@@ -4196,8 +4212,8 @@ async def analytics_summary(project_id: Optional[str] = None, user: dict = Depen
         total_leads, visits_today, followups_pending, trend, sources, *stage_results
     ) = await asyncio.gather(
         db.leads.count_documents(match),
-        db.site_visits.count_documents({**organization_scope(user), "scheduled_at": {"$gte": today_start, "$lte": today_end}}),
-        db.follow_ups.count_documents({**organization_scope(user), "status": "pending"}),
+        db.site_visits.count_documents({**work_scope, "scheduled_at": {"$gte": today_start, "$lte": today_end}}),
+        db.follow_ups.count_documents({**work_scope, "status": "pending"}),
         get_trend(),
         get_sources(),
         *stage_tasks
@@ -4249,7 +4265,13 @@ def _with_env_integration_defaults(settings: Optional[dict]) -> dict:
         # The current rollout uses one shared CallerDesk account. Its Vercel
         # credentials must override stale per-organisation values until each
         # organisation has its own confirmed CallerDesk account configuration.
-        if key in {"callerdesk_authcode", "callerdesk_virtual_number"} or not merged.get(key):
+        # Evolution is deployed as a single server integration, just like the
+        # working WhatsApp reference.  Do not let an old organisation record
+        # silently replace the live API URL, API key, or shared instance.
+        if key in {
+            "callerdesk_authcode", "callerdesk_virtual_number",
+            "evolution_api_url", "evolution_api_key", "evolution_instance_name",
+        } or not merged.get(key):
             merged[key] = value
     if defaults.get("evolution_api_url") and defaults.get("evolution_api_key"):
         merged["whatsapp_provider"] = "evolution"
@@ -4406,6 +4428,35 @@ async def get_integration_settings(organization_id: Optional[str] = None) -> dic
     return _with_env_integration_defaults(merged)
 
 
+def _email_domain(address: Optional[str]) -> str:
+    value = str(address or "").strip().lower()
+    return value.rsplit("@", 1)[1] if "@" in value else ""
+
+
+def _sender_for_actor(actor: dict, settings: dict) -> str:
+    """Use a team member's address only within the verified organisation domain."""
+    fallback = str(settings.get("resend_from_email") or SENDER_EMAIL).strip()
+    verified_domain = str(settings.get("resend_domain") or _email_domain(fallback)).strip().lower()
+    actor_email = str(actor.get("email") or "").strip().lower()
+    if verified_domain and actor_email.endswith(f"@{verified_domain}"):
+        return actor_email
+    return fallback
+
+
+async def _send_resend_email(*, sender: str, recipient: str, subject: str, body: str) -> dict:
+    if not resend or not resend.api_key:
+        raise HTTPException(status_code=503, detail="Email delivery is not configured. Add RESEND_API_KEY to the backend environment.")
+    try:
+        result = await asyncio.to_thread(
+            resend.Emails.send,
+            {"from": sender, "to": [recipient], "subject": subject, "html": body.replace("\n", "<br>")},
+        )
+    except Exception as exc:
+        log.warning("Resend email delivery failed: %s", exc)
+        raise HTTPException(status_code=502, detail="Email delivery failed. Check the Resend sender and API key.") from exc
+    return result if isinstance(result, dict) else {}
+
+
 def _provider_configured(settings: dict, prefix: str) -> bool:
     return bool(settings.get(f"{prefix}_service_url") and settings.get(f"{prefix}_access_token"))
 
@@ -4434,8 +4485,18 @@ async def log_sms(lead_id: str, body: SmsLogBody, actor: dict = Depends(get_curr
 @api.post("/leads/{lead_id}/log-email")
 async def log_email(lead_id: str, body: EmailLogBody, actor: dict = Depends(get_current_user)):
     await require_lead_access(lead_id, actor)
-    await log_activity(lead_id, actor, "email_sent", body.subject, body.model_dump())
-    return {"ok": True}
+    lead = await db.leads.find_one(scoped_id_query(lead_id, actor), {"_id": 0, "email": 1})
+    if not lead or not lead.get("email"):
+        raise HTTPException(status_code=400, detail="This lead does not have an email address")
+    settings = await get_integration_settings(organization_scope(actor).get("organization_id"))
+    if not settings.get("email_enabled"):
+        raise HTTPException(status_code=400, detail="Email is disabled for this organisation")
+    sender = _sender_for_actor(actor, settings)
+    result = await _send_resend_email(sender=sender, recipient=lead["email"], subject=body.subject, body=body.body)
+    await log_activity(lead_id, actor, "email_sent", body.subject, {
+        **body.model_dump(), "from": sender, "to": lead["email"], "email_id": result.get("id"),
+    })
+    return {"ok": True, "from": sender, "email_id": result.get("id")}
 
 
 async def _message_campaign_leads(body: MessageCampaignBody, actor: dict) -> list[dict]:
@@ -4526,11 +4587,12 @@ async def _deliver_message_campaign_item(campaign: dict, recipient: dict, actor:
     if channel == "whatsapp":
         result = await create_whatsapp_message_for_lead(lead, WhatsAppSendBody(text=campaign["message"]), actor)
         return "sent" if result.get("provider", {}).get("status") not in {"pending_provider", "provider_error", "pending_credentials"} else "pending_provider"
-    if not resend or not resend.api_key:
+    settings = await get_integration_settings(campaign["organization_id"])
+    if not settings.get("email_enabled") or not resend or not resend.api_key:
         return "pending_provider"
-    sender = (await get_integration_settings(campaign["organization_id"])).get("resend_from_email") or SENDER_EMAIL
-    await asyncio.to_thread(resend.Emails.send, {"from": sender, "to": [lead["email"]], "subject": campaign["subject"], "html": campaign["message"].replace("\n", "<br>")})
-    await log_activity(lead["id"], actor, "email_sent", campaign["subject"], {"campaign_id": campaign["id"]})
+    sender = _sender_for_actor(actor, settings)
+    result = await _send_resend_email(sender=sender, recipient=lead["email"], subject=campaign["subject"], body=campaign["message"])
+    await log_activity(lead["id"], actor, "email_sent", campaign["subject"], {"campaign_id": campaign["id"], "from": sender, "to": lead["email"], "email_id": result.get("id")})
     return "sent"
 
 
@@ -4733,6 +4795,43 @@ def _coerce_whatsapp_payload(payload):
                 continue
         break
     return current if isinstance(current, (dict, list)) else payload
+
+
+def _evolution_inbound_message(payload) -> Optional[dict]:
+    """Normalize Evolution's MESSAGES_UPSERT payload without losing its key."""
+    if not isinstance(payload, dict):
+        return None
+    event = payload.get("data") if isinstance(payload.get("data"), dict) else payload
+    key = event.get("key") if isinstance(event, dict) else None
+    message = event.get("message") if isinstance(event, dict) else None
+    if not isinstance(key, dict) or not isinstance(message, dict):
+        return None
+
+    media_types = {
+        "imageMessage": "image",
+        "videoMessage": "video",
+        "audioMessage": "audio",
+        "documentMessage": "document",
+        "documentWithCaptionMessage": "document",
+    }
+    media_key = next((name for name in media_types if name in message), None)
+    media = message.get(media_key) if media_key else {}
+    if media_key == "documentWithCaptionMessage" and isinstance(media, dict):
+        media = media.get("documentMessage") or media
+    media = media if isinstance(media, dict) else {}
+    text = message.get("conversation") or (message.get("extendedTextMessage") or {}).get("text")
+    return {
+        "payload": event,
+        "from_me": bool(key.get("fromMe")),
+        "phone": str(key.get("remoteJid") or "").split("@", 1)[0],
+        "message_id": str(key.get("id") or "") or None,
+        "timestamp": event.get("messageTimestamp"),
+        "text": str(text or media.get("caption") or "[WhatsApp message]").strip(),
+        "message_type": media_types.get(media_key, "text"),
+        "media_url": media.get("url") or media.get("mediaUrl"),
+        "filename": media.get("fileName") or media.get("filename"),
+        "mimetype": media.get("mimetype"),
+    }
 
 
 def _extract_whatsapp_message_id(payload: dict) -> Optional[str]:
@@ -4952,7 +5051,13 @@ def _executive_evolution_instance(actor: dict, organization_id: Optional[str]) -
 async def whatsapp_settings_for_actor(organization_id: Optional[str], actor: dict) -> dict:
     settings = await get_integration_settings(organization_id)
     if actor.get("role") == "executive" and settings.get("whatsapp_provider") == "evolution":
-        settings["evolution_instance_name"] = _executive_evolution_instance(actor, organization_id)
+        # An executive uses the workspace connection until they explicitly
+        # connect a personal WhatsApp account.  Previously this generated an
+        # unsaved propzel_<org>_<user> instance for every send, which Evolution
+        # rejects because that instance has never been created or paired.
+        personal_instance = str(actor.get("whatsapp_evolution_instance") or "").strip()
+        if personal_instance:
+            settings["evolution_instance_name"] = personal_instance
     return settings
 
 
@@ -5013,6 +5118,11 @@ async def forward_whatsapp_message(settings: dict, lead: dict, conversation: dic
         instance = _evolution_instance(settings)
         if not instance:
             return {"status": "pending_credentials", "message": "Set an Evolution instance name for this organisation"}
+        state = await evolution_request("GET", f"/instance/connectionState/{instance}", settings, timeout=25)
+        if state.get("status") in {"provider_error", "pending_credentials"}:
+            return state
+        if _evolution_connection_state(state) not in {"open", "connected"}:
+            return {"status": "provider_error", "message": "WhatsApp is disconnected. Reconnect the WhatsApp account and scan its QR code before sending messages."}
         return await evolution_request("POST", f"/message/sendText/{instance}", settings, {"number": number, "text": text, "delay": 0, "linkPreview": True}, timeout=90)
     bearer = settings.get("marketly_bearer_token")
     marketly_instance = settings.get("marketly_instance_id") or settings.get("whatsapp_instance_id")
@@ -5477,6 +5587,11 @@ async def _send_whatsapp_attachment(conv: dict, lead: dict, file: UploadFile, ca
     instance = _evolution_instance(settings)
     if not instance:
         raise HTTPException(status_code=400, detail="Set an Evolution instance name for this organisation")
+    state = await evolution_request("GET", f"/instance/connectionState/{instance}", settings, timeout=25)
+    if state.get("status") in {"provider_error", "pending_credentials"}:
+        raise HTTPException(status_code=502, detail=state.get("message") or "Could not verify the WhatsApp connection")
+    if _evolution_connection_state(state) not in {"open", "connected"}:
+        raise HTTPException(status_code=409, detail="WhatsApp is disconnected. Reconnect the WhatsApp account and scan its QR code before sending attachments.")
     filename = file.filename or "attachment"
     mime = (file.content_type or "application/octet-stream").split(";", 1)[0]
     number = "".join(ch for ch in str(lead.get("phone")) if ch.isdigit())
@@ -5520,21 +5635,22 @@ async def whatsapp_webhook(request: Request, organization_id: Optional[str] = No
         payload = await request.json()
     else:
         payload = dict(await request.form())
+    evolution_message = _evolution_inbound_message(payload)
     payload = _coerce_whatsapp_payload(payload)
 
-    from_me = str(_first_payload_value(payload, ["fromMe", "from_me", "is_from_me"]) or "").lower()
+    from_me = "true" if evolution_message and evolution_message["from_me"] else str(_first_payload_value(payload, ["fromMe", "from_me", "is_from_me"]) or "").lower()
     direction_hint = str(_first_payload_value(payload, ["direction", "event", "type"]) or "").lower()
     direction = "outgoing" if from_me in {"true", "1", "yes"} or "outgoing" in direction_hint else "incoming"
     if direction != "incoming":
         return {"ok": True, "ignored": "outgoing_status"}
 
-    phone_digits = _extract_whatsapp_phone(payload)
+    phone_digits = "".join(ch for ch in str((evolution_message or {}).get("phone") or "") if ch.isdigit()) or _extract_whatsapp_phone(payload)
     if not phone_digits:
         log.warning("WhatsApp webhook payload did not contain a sender phone; keys=%s", list(payload.keys()) if isinstance(payload, dict) else type(payload).__name__)
         return {"ok": False, "detail": "No WhatsApp sender phone found"}
     chat_id = whatsapp_chat_id(phone_digits)
-    text = _extract_whatsapp_text(payload)
-    provider_message_id = _extract_whatsapp_message_id(payload)
+    text = (evolution_message or {}).get("text") or _extract_whatsapp_text(payload)
+    provider_message_id = (evolution_message or {}).get("message_id") or _extract_whatsapp_message_id(payload)
     if provider_message_id:
         existing = await db.whatsapp_messages.find_one({"provider_message_id": provider_message_id}, {"_id": 0})
         if existing:
@@ -5572,12 +5688,15 @@ async def whatsapp_webhook(request: Request, organization_id: Optional[str] = No
         "direction": "incoming",
         "sender_id": None,
         "sender_name": conv.get("contact_name") or phone_digits,
-        "message_type": "text",
+        "message_type": (evolution_message or {}).get("message_type") or "text",
         "text": text,
+        "media_url": (evolution_message or {}).get("media_url"),
+        "filename": (evolution_message or {}).get("filename"),
+        "mimetype": (evolution_message or {}).get("mimetype"),
         "provider_message_id": provider_message_id,
         "provider_status": "received",
-        "provider_response": payload,
-        "created_at": now,
+        "provider_response": evolution_message.get("payload") if evolution_message else payload,
+        "created_at": _extract_whatsapp_timestamp((evolution_message or {}).get("payload") or payload) if evolution_message else now,
     }
     await db.whatsapp_messages.insert_one(msg)
     await db.whatsapp_conversations.update_one(
@@ -5791,8 +5910,16 @@ async def list_partners(user: dict = Depends(get_current_user)):
     return [sanitize_contact_doc(d, user) for d in docs]
 
 
+async def _can_manage_channel_partners(actor: dict) -> bool:
+    if actor.get("role") in {"admin", "super_admin"}:
+        return True
+    return actor.get("role") == "manager" and await _organization_has_built_up_area(organization_scope(actor).get("organization_id"))
+
+
 @api.post("/channel-partners")
-async def create_partner(body: ChannelPartnerBody, actor: dict = Depends(require_roles("admin"))):
+async def create_partner(body: ChannelPartnerBody, actor: dict = Depends(get_current_user)):
+    if not await _can_manage_channel_partners(actor):
+        raise HTTPException(status_code=403, detail="Only Jagati managers and administrators can add channel partners")
     doc = body.model_dump()
     doc["id"] = new_id()
     doc["organization_id"] = organization_scope(actor).get("organization_id")
@@ -5803,7 +5930,9 @@ async def create_partner(body: ChannelPartnerBody, actor: dict = Depends(require
 
 
 @api.patch("/channel-partners/{pid}")
-async def update_partner(pid: str, body: ChannelPartnerBody, actor: dict = Depends(require_roles("admin"))):
+async def update_partner(pid: str, body: ChannelPartnerBody, actor: dict = Depends(get_current_user)):
+    if not await _can_manage_channel_partners(actor):
+        raise HTTPException(status_code=403, detail="Only Jagati managers and administrators can edit channel partners")
     r = await db.channel_partners.update_one(scoped_id_query(pid, actor), {"$set": body.model_dump(exclude_none=True)})
     if r.matched_count == 0:
         raise HTTPException(status_code=404, detail="Partner not found")
@@ -5897,8 +6026,9 @@ def _month_bounds(dt: datetime) -> tuple:
 async def dashboard_monthly(date_from: Optional[str] = None, date_to: Optional[str] = None, user: dict = Depends(get_current_user)):
     """Month's Updates tab data. Now fully parallelized."""
     scope: dict = organization_scope(user)
-    if user["role"] in {"executive", "sales"}:
+    if not has_company_wide_access(user):
         scope["assigned_to"] = user["id"]
+    activity_scope = activity_scope_for(user)
 
     now = now_utc()
     cur_start = _report_date(date_from, _month_bounds(now)[0])
@@ -5939,7 +6069,7 @@ async def dashboard_monthly(date_from: Optional[str] = None, date_to: Optional[s
                 ("sms_sent", ["sms_sent"]),
                 ("followup_scheduled", ["followup_scheduled"]),
             ):
-                tasks.append(db.activities.count_documents({**scope,
+                tasks.append(db.activities.count_documents({**activity_scope,
                     "kind": {"$in": kinds},
                     "created_at": {"$gte": iso(ms), "$lt": iso(me)},
                 }))
@@ -5999,8 +6129,9 @@ async def dashboard_monthly(date_from: Optional[str] = None, date_to: Optional[s
 @api.get("/dashboard/action-items")
 async def dashboard_action_items(date_from: Optional[str] = None, date_to: Optional[str] = None, user: dict = Depends(get_current_user)):
     scope: dict = organization_scope(user)
-    if user["role"] in {"executive", "sales"}:
+    if not has_company_wide_access(user):
         scope["assigned_to"] = user["id"]
+    activity_scope = activity_scope_for(user)
 
     now = now_utc()
     day_start = _report_date(date_from, datetime(now.year, now.month, now.day, tzinfo=timezone.utc))
@@ -6011,8 +6142,8 @@ async def dashboard_action_items(date_from: Optional[str] = None, date_to: Optio
 
     # Parallelize phase 1
     (missed, dnp_calls, todays_followups, scheduled_calls, tasks, planned_visits, lead_docs) = await asyncio.gather(
-        db.activities.count_documents({**scope, "kind": "missed_call", "created_at": {"$gte": iso(day_start), "$lt": iso(day_end)}}),
-        db.activities.count_documents({**scope, "kind": "missed_call", "meta.disposition": "dnp", "created_at": {"$gte": iso(day_start), "$lt": iso(day_end)}}),
+        db.activities.count_documents({**activity_scope, "kind": "missed_call", "created_at": {"$gte": iso(day_start), "$lt": iso(day_end)}}),
+        db.activities.count_documents({**activity_scope, "kind": "missed_call", "meta.disposition": "dnp", "created_at": {"$gte": iso(day_start), "$lt": iso(day_end)}}),
         db.follow_ups.find({**scope, "status": "pending", "due_at": {"$gte": iso(day_start), "$lt": iso(day_end)}}, {"_id": 0}).sort("due_at", 1).to_list(100),
         db.follow_ups.count_documents({**scope, "status": "pending", "kind": "call"}),
         db.follow_ups.count_documents({**scope, "status": "pending", "kind": {"$in": ["meeting", "email", "whatsapp"]}}),
@@ -6089,7 +6220,7 @@ async def _report_context(
         match["source"] = source
     if assigned_to and assigned_to != "all":
         match["assigned_to"] = assigned_to
-    if user.get("role") != "super_admin":
+    if not has_company_wide_access(user):
         match["assigned_to"] = user["id"]
     return start_dt, end_dt, match
 
@@ -6110,17 +6241,17 @@ async def report_summary(
 ):
     start_dt, end_dt, lead_match = await _report_context(start, end, date_field, user, stage, source, assigned_to)
     activity_match = {**organization_scope(user), "created_at": {"$gte": start_dt.isoformat(), "$lte": end_dt.isoformat()}}
-    if user.get("role") != "super_admin":
+    if not has_company_wide_access(user):
         activity_match["$or"] = [{"actor_id": user["id"]}, {"user_id": user["id"]}]
     followup_match = {**organization_scope(user), "created_at": activity_match["created_at"], "status": {"$in": ["pending", "completed", "dismissed"]}}
-    if user.get("role") != "super_admin":
+    if not has_company_wide_access(user):
         followup_match["assigned_to"] = user["id"]
     leads, activities, followups = await asyncio.gather(
         db.leads.find(lead_match, {"_id": 0}).to_list(5000),
         db.activities.find(activity_match, {"_id": 0}).to_list(10000),
         db.follow_ups.find(followup_match, {"_id": 0}).to_list(5000),
     )
-    if user.get("role") != "super_admin":
+    if not has_company_wide_access(user):
         activities = [a for a in activities if (a.get("actor_id") or a.get("user_id")) == user["id"]]
     outgoing_calls = [a for a in activities if a.get("kind") in {"outgoing_call", "call", "missed_call"} and a.get("meta", {}).get("direction", "outgoing") == "outgoing"]
     incoming_calls = [a for a in activities if a.get("kind") == "incoming_call" or a.get("meta", {}).get("direction") == "incoming"]
@@ -6142,20 +6273,20 @@ async def report_summary(
 
 
 @api.get("/reports/activity")
-async def report_activity(start: Optional[str] = None, end: Optional[str] = None, date_field: str = "created", assigned_to: Optional[str] = None, user: dict = Depends(get_current_user)):
+async def report_activity(start: Optional[str] = None, end: Optional[str] = None, date_field: str = "created", assigned_to: Optional[str] = None, user: dict = Depends(require_roles("admin"))):
     start_dt, end_dt, lead_match = await _report_context(start, end, date_field, user, assigned_to=assigned_to)
     activity_match = {**organization_scope(user), "created_at": {"$gte": start_dt.isoformat(), "$lte": end_dt.isoformat()}}
-    if user.get("role") != "super_admin":
+    if not has_company_wide_access(user):
         activity_match["$or"] = [{"actor_id": user["id"]}, {"user_id": user["id"]}]
     rows = await db.activities.find(activity_match, {"_id": 0}).to_list(20000)
-    if user.get("role") != "super_admin":
+    if not has_company_wide_access(user):
         rows = [row for row in rows if (row.get("actor_id") or row.get("user_id")) == user["id"]]
-    if user.get("role") == "super_admin" and "assigned_to" in lead_match:
+    if has_company_wide_access(user) and "assigned_to" in lead_match:
         scoped = await db.leads.find(lead_match, {"_id": 0, "id": 1}).to_list(20000)
         allowed = {lead["id"] for lead in scoped}
         rows = [row for row in rows if row.get("lead_id") in allowed]
     user_match = {"organization_id": organization_scope(user).get("organization_id")}
-    if user.get("role") != "super_admin":
+    if not has_company_wide_access(user):
         user_match["id"] = user["id"]
     users = {u["id"]: u.get("name", u["id"]) for u in await db.users.find(user_match, {"_id": 0, "id": 1, "name": 1}).to_list(500)}
     lead_ids = list({r.get("lead_id") for r in rows if r.get("lead_id")})
@@ -6188,15 +6319,15 @@ async def report_calls(
     end: Optional[str] = None,
     date_field: str = "created",
     assigned_to: Optional[str] = None,
-    user: dict = Depends(get_current_user),
+    user: dict = Depends(require_roles("admin")),
 ):
     """Return the call rows behind the report counters, with the same scope."""
     start_dt, end_dt, lead_match = await _report_context(start, end, date_field, user, assigned_to=assigned_to)
     activity_match = {**organization_scope(user), "created_at": {"$gte": start_dt.isoformat(), "$lte": end_dt.isoformat()}}
-    if user.get("role") != "super_admin":
+    if not has_company_wide_access(user):
         activity_match["$or"] = [{"actor_id": user["id"]}, {"user_id": user["id"]}]
     lead_ids = None
-    if user.get("role") != "super_admin" or assigned_to and assigned_to != "all":
+    if not has_company_wide_access(user) or assigned_to and assigned_to != "all":
         lead_ids = [lead["id"] for lead in await db.leads.find(lead_match, {"_id": 0, "id": 1}).to_list(20000)]
         activity_match["lead_id"] = {"$in": lead_ids} if lead_ids else "__none__"
     rows = await db.activities.find(activity_match, {"_id": 0}).sort("created_at", -1).to_list(20000)
@@ -6226,13 +6357,13 @@ async def report_calls(
 
 
 @api.get("/reports/daily")
-async def report_daily(start: Optional[str] = None, end: Optional[str] = None, user: dict = Depends(get_current_user)):
+async def report_daily(start: Optional[str] = None, end: Optional[str] = None, user: dict = Depends(require_roles("admin"))):
     start_dt, end_dt, _ = await _report_context(start, end, "created", user)
     activity_match = {**organization_scope(user), "created_at": {"$gte": start_dt.isoformat(), "$lte": end_dt.isoformat()}}
-    if user.get("role") != "super_admin":
+    if not has_company_wide_access(user):
         activity_match["$or"] = [{"actor_id": user["id"]}, {"user_id": user["id"]}]
     rows = await db.activities.find(activity_match, {"_id": 0}).to_list(20000)
-    if user.get("role") != "super_admin":
+    if not has_company_wide_access(user):
         rows = [row for row in rows if (row.get("actor_id") or row.get("user_id")) == user["id"]]
     buckets = {}
     cursor = start_dt.date()
@@ -6251,11 +6382,11 @@ async def report_daily(start: Optional[str] = None, end: Optional[str] = None, u
 
 
 @api.get("/reports/user-status")
-async def report_user_status(start: Optional[str] = None, end: Optional[str] = None, date_field: str = "created", user: dict = Depends(get_current_user)):
+async def report_user_status(start: Optional[str] = None, end: Optional[str] = None, date_field: str = "created", user: dict = Depends(require_roles("admin"))):
     _, _, match = await _report_context(start, end, date_field, user)
     leads = await db.leads.find(match, {"_id": 0}).to_list(20000)
     user_match = {"organization_id": organization_scope(user).get("organization_id")}
-    if user.get("role") != "super_admin":
+    if not has_company_wide_access(user):
         user_match["id"] = user["id"]
     users = {u["id"]: u.get("name", u["id"]) for u in await db.users.find(user_match, {"_id": 0, "id": 1, "name": 1}).to_list(500)}
     stages = ["new", "contacted", "contacted_dnp", "qualified", "qualified_dnp", "site_visit", "site_visit_dnp", "negotiation", "negotiation_dnp", "booked", "lost"]
@@ -6267,7 +6398,7 @@ async def report_user_status(start: Optional[str] = None, end: Optional[str] = N
 
 
 @api.get("/reports/not-interested")
-async def report_not_interested(start: Optional[str] = None, end: Optional[str] = None, date_field: str = "updated", user: dict = Depends(get_current_user)):
+async def report_not_interested(start: Optional[str] = None, end: Optional[str] = None, date_field: str = "updated", user: dict = Depends(require_roles("admin"))):
     _, _, match = await _report_context(start, end, date_field, user)
     match["$or"] = [{"stage": "lost"}, {"lost_reason": {"$exists": True}}]
     rows = await db.leads.find(match, {"_id": 0}).sort("updated_at", -1).to_list(20000)
@@ -6275,11 +6406,11 @@ async def report_not_interested(start: Optional[str] = None, end: Optional[str] 
 
 
 @api.get("/reports/executives")
-async def report_executives(user: dict = Depends(get_current_user)):
+async def report_executives(user: dict = Depends(require_roles("admin"))):
     scope = organization_scope(user)
-    if user.get("role") != "super_admin" and user.get("role") != "executive":
+    if user.get("role") not in {"admin", "super_admin"}:
         return []
-    user_filter = {"id": user["id"]} if user.get("role") != "super_admin" else {}
+    user_filter = {}
     execs = await db.users.find({"role": "executive", "organization_id": scope.get("organization_id"), **user_filter}, {"_id": 0, "password_hash": 0}).to_list(100)
     rows = []
     for e in execs:
@@ -6298,7 +6429,7 @@ async def report_executives(user: dict = Depends(get_current_user)):
 
 
 @api.get("/reports/sources")
-async def report_sources(start: Optional[str] = None, end: Optional[str] = None, date_field: str = "created", stage: Optional[str] = None, source: Optional[str] = None, assigned_to: Optional[str] = None, user: dict = Depends(get_current_user)):
+async def report_sources(start: Optional[str] = None, end: Optional[str] = None, date_field: str = "created", stage: Optional[str] = None, source: Optional[str] = None, assigned_to: Optional[str] = None, user: dict = Depends(require_roles("admin"))):
     _, _, match = await _report_context(start, end, date_field, user, stage, source, assigned_to)
     pipe = [{"$match": match}, {"$group": {"_id": {"source": "$source", "stage": "$stage"}, "count": {"$sum": 1}}}]
     rows = {}
@@ -7201,8 +7332,8 @@ async def dashboard_revenue_breakdown(user: dict = Depends(get_current_user)):
     else:
         cur_end = datetime(now.year, now.month + 1, 1, tzinfo=timezone.utc)
 
-    match: dict = {"status": "accepted", "created_at": {"$gte": cur_start.isoformat(), "$lt": cur_end.isoformat()}}
-    if user["role"] in {"executive", "sales"}:
+    match: dict = {**organization_scope(user), "status": "accepted", "created_at": {"$gte": cur_start.isoformat(), "$lt": cur_end.isoformat()}}
+    if not has_company_wide_access(user):
         match["created_by"] = user["id"]
 
     # by agent
