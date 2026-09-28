@@ -3281,6 +3281,11 @@ def has_company_wide_access(user: dict) -> bool:
     return user.get("role") in {"admin", "super_admin"}
 
 
+def hides_super_admins(user: dict) -> bool:
+    """Super Admin identities are never part of an organisation's directory."""
+    return user.get("role") != "super_admin"
+
+
 def activity_scope_for(user: dict) -> dict:
     """Keep activity metrics tied to the actor for non-administrator dashboards."""
     scope = organization_scope(user)
@@ -3453,6 +3458,8 @@ async def list_users(all_organizations: bool = False, user: dict = Depends(get_c
         query = {}
     else:
         query = organization_scope(user)
+    if hides_super_admins(user):
+        query["role"] = {"$ne": "super_admin"}
     docs = await db.users.find(query, {"password_hash": 0, "_id": 0}).sort("created_at", -1).to_list(500)
     return [sanitize_contact_doc(d, user) for d in docs]
 
@@ -6279,6 +6286,9 @@ async def report_activity(start: Optional[str] = None, end: Optional[str] = None
     if not has_company_wide_access(user):
         activity_match["$or"] = [{"actor_id": user["id"]}, {"user_id": user["id"]}]
     rows = await db.activities.find(activity_match, {"_id": 0}).to_list(20000)
+    if hides_super_admins(user):
+        super_admin_ids = {u["id"] for u in await db.users.find({"role": "super_admin"}, {"_id": 0, "id": 1}).to_list(100)}
+        rows = [row for row in rows if (row.get("actor_id") or row.get("user_id")) not in super_admin_ids]
     if not has_company_wide_access(user):
         rows = [row for row in rows if (row.get("actor_id") or row.get("user_id")) == user["id"]]
     if has_company_wide_access(user) and "assigned_to" in lead_match:
@@ -6286,6 +6296,8 @@ async def report_activity(start: Optional[str] = None, end: Optional[str] = None
         allowed = {lead["id"] for lead in scoped}
         rows = [row for row in rows if row.get("lead_id") in allowed]
     user_match = {"organization_id": organization_scope(user).get("organization_id")}
+    if hides_super_admins(user):
+        user_match["role"] = {"$ne": "super_admin"}
     if not has_company_wide_access(user):
         user_match["id"] = user["id"]
     users = {u["id"]: u.get("name", u["id"]) for u in await db.users.find(user_match, {"_id": 0, "id": 1, "name": 1}).to_list(500)}
@@ -6331,6 +6343,9 @@ async def report_calls(
         lead_ids = [lead["id"] for lead in await db.leads.find(lead_match, {"_id": 0, "id": 1}).to_list(20000)]
         activity_match["lead_id"] = {"$in": lead_ids} if lead_ids else "__none__"
     rows = await db.activities.find(activity_match, {"_id": 0}).sort("created_at", -1).to_list(20000)
+    if hides_super_admins(user):
+        super_admin_ids = {u["id"] for u in await db.users.find({"role": "super_admin"}, {"_id": 0, "id": 1}).to_list(100)}
+        rows = [row for row in rows if (row.get("actor_id") or row.get("user_id")) not in super_admin_ids]
     calls = []
     for row in rows:
         kind = row.get("kind", "")
@@ -6342,7 +6357,10 @@ async def report_calls(
         calls.append(row)
     lead_ids = list({row.get("lead_id") for row in calls if row.get("lead_id")})
     leads = {lead["id"]: sanitize_phone_fields(lead, user) for lead in await db.leads.find({"id": {"$in": lead_ids}, **organization_scope(user)}, {"_id": 0}).to_list(len(lead_ids) or 1)}
-    users = {person["id"]: person.get("name", person["id"]) for person in await db.users.find({"organization_id": organization_scope(user).get("organization_id")}, {"_id": 0, "id": 1, "name": 1}).to_list(500)}
+    user_match = {"organization_id": organization_scope(user).get("organization_id")}
+    if hides_super_admins(user):
+        user_match["role"] = {"$ne": "super_admin"}
+    users = {person["id"]: person.get("name", person["id"]) for person in await db.users.find(user_match, {"_id": 0, "id": 1, "name": 1}).to_list(500)}
     return [{
         "id": row.get("id"),
         "lead_id": row.get("lead_id"),
@@ -6386,6 +6404,8 @@ async def report_user_status(start: Optional[str] = None, end: Optional[str] = N
     _, _, match = await _report_context(start, end, date_field, user)
     leads = await db.leads.find(match, {"_id": 0}).to_list(20000)
     user_match = {"organization_id": organization_scope(user).get("organization_id")}
+    if hides_super_admins(user):
+        user_match["role"] = {"$ne": "super_admin"}
     if not has_company_wide_access(user):
         user_match["id"] = user["id"]
     users = {u["id"]: u.get("name", u["id"]) for u in await db.users.find(user_match, {"_id": 0, "id": 1, "name": 1}).to_list(500)}
