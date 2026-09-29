@@ -7778,38 +7778,50 @@ SENDER_EMAIL = os.environ.get("SENDER_EMAIL", "onboarding@resend.dev")
 IST = timezone(timedelta(hours=5, minutes=30))
 
 
-async def compute_eod_summary(target_date: Optional[datetime] = None) -> dict:
-    """Aggregate today's key metrics for the admin."""
+async def compute_eod_summary(
+    target_date: Optional[datetime] = None,
+    organization_id: Optional[str] = None,
+) -> dict:
+    """Aggregate one organisation's daily metrics using the IST calendar day."""
     now = target_date or now_utc()
-    day_start = datetime(now.year, now.month, now.day, tzinfo=timezone.utc)
-    day_end = day_start + timedelta(days=1)
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=timezone.utc)
+    local_now = now.astimezone(IST)
+    local_start = datetime(local_now.year, local_now.month, local_now.day, tzinfo=IST)
+    day_start = local_start.astimezone(timezone.utc)
+    day_end = (local_start + timedelta(days=1)).astimezone(timezone.utc)
     s, e = day_start.isoformat(), day_end.isoformat()
+    scope = {"organization_id": organization_id} if organization_id else {}
 
     # Follow-ups due today
     fu_due = await db.follow_ups.count_documents({
+        **scope,
         "status": "pending",
         "due_at": {"$gte": s, "$lt": e},
     })
     fu_overdue = await db.follow_ups.count_documents({
+        **scope,
         "status": "pending",
         "due_at": {"$lt": now.isoformat()},
     })
 
     # Milestones today
     bookings_today = await db.leads.count_documents({
+        **scope,
         "stage": "booked",
         "updated_at": {"$gte": s, "$lt": e},
     })
     site_visits_completed = await db.site_visits.count_documents({
+        **scope,
         "status": "completed",
         "scheduled_at": {"$gte": s, "$lt": e},
     })
-    new_leads = await db.leads.count_documents({"created_at": {"$gte": s, "$lt": e}})
+    new_leads = await db.leads.count_documents({**scope, "created_at": {"$gte": s, "$lt": e}})
 
     # Calls (from activities): total, connected, missed, total talk time
     call_kinds = ["outgoing_call", "incoming_call", "missed_call", "call"]
     calls_pipe = [
-        {"$match": {"kind": {"$in": call_kinds}, "created_at": {"$gte": s, "$lt": e}}},
+        {"$match": {**scope, "kind": {"$in": call_kinds}, "created_at": {"$gte": s, "$lt": e}}},
         {"$group": {
             "_id": None,
             "total": {"$sum": 1},
@@ -7830,7 +7842,7 @@ async def compute_eod_summary(target_date: Optional[datetime] = None) -> dict:
 
     # Top performers today (bookings / calls)
     pipe = [
-        {"$match": {"kind": {"$in": call_kinds}, "created_at": {"$gte": s, "$lt": e}, "actor_id": {"$ne": None}}},
+        {"$match": {**scope, "kind": {"$in": call_kinds}, "created_at": {"$gte": s, "$lt": e}, "actor_id": {"$ne": None}}},
         {"$group": {"_id": "$actor_id", "calls": {"$sum": 1}, "talk_time": {"$sum": {"$ifNull": ["$meta.duration_sec", 0]}}}},
         {"$sort": {"calls": -1}}, {"$limit": 5},
     ]
@@ -7844,7 +7856,8 @@ async def compute_eod_summary(target_date: Optional[datetime] = None) -> dict:
         })
 
     return {
-        "date": day_start.date().isoformat(),
+        "date": local_start.date().isoformat(),
+        "organization_id": organization_id,
         "generated_at": now_utc().isoformat(),
         "followups": {"due_today": fu_due, "overdue": fu_overdue},
         "milestones": {
@@ -7879,7 +7892,7 @@ def _eod_html(summary: dict) -> str:
     return f"""<div style="font-family:Georgia,serif;max-width:640px;margin:0 auto;background:#F6F1E8;padding:32px;color:#102A20;">
 <div style="letter-spacing:0.22em;font-size:11px;text-transform:uppercase;color:#5C6661;">Propzel · Daily Summary</div>
 <h1 style="font-size:28px;margin:8px 0 4px;letter-spacing:-0.02em;">End of day report</h1>
-<div style="color:#5C6661;font-size:14px;">{summary['date']}</div>
+<div style="color:#5C6661;font-size:14px;">{summary.get('organization_name', 'Organisation')} · {summary['date']}</div>
 
 <table style="width:100%;margin-top:24px;border-collapse:collapse;background:#fff;border:1px solid #E6E4DD;">
   <tr>
@@ -7942,57 +7955,58 @@ def _eod_html(summary: dict) -> str:
 </div>"""
 
 
-async def send_eod_email_to_admins() -> dict:
-    """Send today's summary to all admin users. Uses Resend when available."""
-    summary = await compute_eod_summary()
-    admins = await db.users.find({"role": "admin", "active": {"$ne": False}}, {"_id": 0}).to_list(50)
-    if not admins:
-        return {"sent": 0, "reason": "no admins"}
-    html = _eod_html(summary)
-    subject = f"Propzel · End of day report · {summary['date']}"
+async def send_eod_email_to_admins(organization_id: Optional[str] = None) -> dict:
+    """Deliver a separate, organisation-scoped EOD report to each organisation admin."""
+    org_query = {"id": organization_id} if organization_id else {"active": {"$ne": False}}
+    organizations = await db.organizations.find(org_query, {"_id": 0, "id": 1, "name": 1}).to_list(200)
     sent = 0
     errors = []
-    for a in admins:
-        if not a.get("email"):
+    for organization in organizations:
+        org_id = organization["id"]
+        admins = await db.users.find(
+            {"role": "admin", "active": {"$ne": False}, "organization_id": org_id},
+            {"_id": 0},
+        ).to_list(50)
+        if not admins:
             continue
-        params = {"from": SENDER_EMAIL, "to": [a["email"]], "subject": subject, "html": html}
-        try:
-            if resend and resend.api_key:
-                r = await asyncio.to_thread(resend.Emails.send, params)
+        summary = await compute_eod_summary(organization_id=org_id)
+        summary["organization_name"] = organization.get("name") or "Organisation"
+        html = _eod_html(summary)
+        subject = f"Propzel · {summary['organization_name']} daily report · {summary['date']}"
+        for admin in admins:
+            if not admin.get("email"):
+                continue
+            params = {"from": SENDER_EMAIL, "to": [admin["email"]], "subject": subject, "html": html}
+            try:
+                if not resend or not resend.api_key:
+                    raise RuntimeError("RESEND_API_KEY is not configured")
+                result = await asyncio.to_thread(resend.Emails.send, params)
                 sent += 1
                 await db.eod_emails.insert_one({
                     "id": new_id(),
-                    "admin_id": a["id"],
-                    "email": a["email"],
+                    "organization_id": org_id,
+                    "admin_id": admin["id"],
+                    "email": admin["email"],
                     "date": summary["date"],
-                    "email_id": r.get("id") if isinstance(r, dict) else None,
+                    "email_id": result.get("id") if isinstance(result, dict) else None,
                     "created_at": now_utc().isoformat(),
                 })
-            else:
-                log.info("[MOCK] EOD email to %s · subject=%s", a["email"], subject)
-                sent += 1
-                await db.eod_emails.insert_one({
-                    "id": new_id(),
-                    "admin_id": a["id"],
-                    "email": a["email"],
-                    "date": summary["date"],
-                    "mock": True,
-                    "created_at": now_utc().isoformat(),
-                })
-        except Exception as exc:
-            log.warning("EOD email failed for %s: %s", a["email"], exc)
-            errors.append({"email": a["email"], "error": str(exc)})
-    return {"sent": sent, "errors": errors, "date": summary["date"]}
+            except Exception as exc:
+                log.warning("EOD email failed for %s: %s", admin["email"], exc)
+                errors.append({"organization_id": org_id, "email": admin["email"], "error": str(exc)})
+    return {"sent": sent, "errors": errors}
 
 
 @api.get("/admin/eod-summary")
 async def admin_eod_summary(user: dict = Depends(require_roles("admin"))):
-    return await compute_eod_summary()
+    organization_id = None if user.get("role") == "super_admin" else user.get("organization_id")
+    return await compute_eod_summary(organization_id=organization_id)
 
 
 @api.post("/admin/eod-email/send")
 async def admin_eod_email_send(user: dict = Depends(require_roles("admin"))):
-    return await send_eod_email_to_admins()
+    organization_id = None if user.get("role") == "super_admin" else user.get("organization_id")
+    return await send_eod_email_to_admins(organization_id=organization_id)
 
 
 @api.post("/jobs/process-due-call-followups")
@@ -8003,6 +8017,16 @@ async def process_due_call_followups_job(request: Request):
     if not cron_secret or auth != f"Bearer {cron_secret}":
         raise HTTPException(status_code=401, detail="Unauthorized job request")
     return await process_due_call_followups()
+
+
+@api.api_route("/jobs/send-eod-email", methods=["GET", "POST"])
+async def send_eod_email_job(request: Request):
+    """Protected Vercel Cron target for the 6 PM IST daily organisation reports."""
+    cron_secret = os.environ.get("CRON_SECRET", "")
+    auth = request.headers.get("Authorization", "")
+    if not cron_secret or auth != f"Bearer {cron_secret}":
+        raise HTTPException(status_code=401, detail="Unauthorized job request")
+    return await send_eod_email_to_admins()
 
 
 # ---------------------------------------------------------------------------

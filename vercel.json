@@ -1,0 +1,8 @@
+{
+  "crons": [
+    {
+      "path": "/api/jobs/send-eod-email",
+      "schedule": "30 12 * * *"
+    }
+  ]
+}
