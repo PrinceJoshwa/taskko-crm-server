@@ -2966,7 +2966,7 @@ async def require_lead_access(lead_id: str, user: dict) -> dict:
 # ---------------------------------------------------------------------------
 Role = Literal["super_admin", "admin", "manager", "executive", "sales"]
 LeadStage = Literal["new", "contacted", "contacted_dnp", "qualified", "qualified_dnp", "site_visit", "site_visit_dnp", "negotiation", "negotiation_dnp", "booked", "lost"]
-LeadSource = Literal["magicbricks", "99acres", "commonfloor", "housing", "website", "jagathi_website", "google_ads", "facebook", "instagram", "referral", "walk_in", "manual"]
+LeadSource = Literal["magicbricks", "99acres", "commonfloor", "housing", "website", "jagathi_website", "google_ads", "facebook", "instagram", "google_sheets", "referral", "walk_in", "manual"]
 UnitStatus = Literal["available", "held", "booked", "sold"]
 VisitStatus = Literal["scheduled", "completed", "no_show", "cancelled"]
 FollowUpStatus = Literal["pending", "done", "missed"]
@@ -3080,6 +3080,20 @@ class LeadBody(BaseDoc):
     co_assigned_to: Optional[List[str]] = None
     stage: LeadStage = "new"
     stars: Optional[int] = 0
+
+
+class GoogleSheetsLeadBody(BaseDoc):
+    """One spreadsheet row, normalized by the Google Apps Script."""
+    row_key: str = Field(min_length=1, max_length=300)
+    name: str = Field(min_length=1, max_length=200)
+    phone: Optional[str] = None
+    email: Optional[EmailStr] = None
+    project_name: Optional[str] = None
+    budget_min: Optional[float] = None
+    budget_max: Optional[float] = None
+    configuration: Optional[str] = None
+    location_pref: Optional[str] = None
+    notes: Optional[str] = None
 
 
 class UpdateLeadBody(BaseDoc):
@@ -3899,6 +3913,85 @@ async def delete_lead(lead_id: str, actor: dict = Depends(require_roles("admin")
 # ---------------------------------------------------------------------------
 # LEAD WEBHOOKS — generic receiver for external platforms
 # ---------------------------------------------------------------------------
+@api.post("/integrations/google-sheets/{organization_id}/leads")
+async def ingest_google_sheet_lead(
+    organization_id: str,
+    body: GoogleSheetsLeadBody,
+    request: Request,
+):
+    """Create one organisation-scoped lead from the approved Google Apps Script."""
+    expected_secret = os.environ.get("GOOGLE_SHEETS_SYNC_SECRET", "")
+    supplied_secret = request.headers.get("X-Propzel-Sync-Key", "")
+    if not expected_secret:
+        raise HTTPException(status_code=503, detail="Google Sheets sync is not configured")
+    if not secrets.compare_digest(supplied_secret, expected_secret):
+        raise HTTPException(status_code=401, detail="Invalid Google Sheets sync key")
+
+    organization = await db.organizations.find_one(
+        {"id": organization_id, "active": {"$ne": False}}, {"_id": 0, "id": 1},
+    )
+    if not organization:
+        raise HTTPException(status_code=404, detail="Organisation not found")
+
+    existing = await db.leads.find_one(
+        {"organization_id": organization_id, "google_sheets_row_key": body.row_key},
+        {"_id": 0, "id": 1},
+    )
+    if existing:
+        return {"ok": True, "created": False, "lead_id": existing["id"]}
+
+    project_id = None
+    if body.project_name and body.project_name.strip():
+        project = await db.projects.find_one(
+            {"organization_id": organization_id, "name": {"$regex": f"^{re.escape(body.project_name.strip())}$", "$options": "i"}},
+            {"_id": 0, "id": 1},
+        )
+        project_id = (project or {}).get("id")
+
+    now = now_utc().isoformat()
+    lead = {
+        "id": new_id(),
+        "organization_id": organization_id,
+        "google_sheets_row_key": body.row_key,
+        "name": body.name.strip(),
+        "phone": body.phone,
+        "email": str(body.email) if body.email else None,
+        "source": "google_sheets",
+        "project_id": project_id,
+        "budget_min": body.budget_min,
+        "budget_max": body.budget_max,
+        "configuration": body.configuration,
+        "location_pref": body.location_pref,
+        "notes": body.notes,
+        "stage": "new",
+        "priority": "warm",
+        "stars": 0,
+        "created_at": now,
+        "updated_at": now,
+    }
+    settings = await db.settings.find_one({"id": f"organization:{organization_id}"}) or {}
+    if settings.get("auto_assign_enabled", True):
+        lead["assigned_to"] = await _pick_auto_assignee(organization_id)
+    await db.leads.insert_one(lead)
+    await log_activity(
+        lead["id"],
+        None,
+        "lead_created",
+        "Imported from Google Sheets",
+        {"organization_id": organization_id, "google_sheets_row_key": body.row_key},
+    )
+    if lead.get("assigned_to"):
+        await create_notification(
+            type="lead_assigned",
+            title="New lead assigned",
+            message=f"{lead['name']} · Google Sheets",
+            user_id=lead["assigned_to"],
+            link=f"/leads/{lead['id']}",
+            meta={"lead_id": lead["id"]},
+        )
+    return {"ok": True, "created": True, "lead_id": lead["id"], "project_matched": bool(project_id)}
+
+
 async def _ingest_lead_from_payload(source: str, payload: dict) -> dict:
     """Normalize an incoming external lead payload into a lead document."""
     name = payload.get("name") or payload.get("full_name") or payload.get("customer_name") or "Unknown"
@@ -3963,7 +4056,7 @@ async def webhook_leads(source: str, payload: dict):
     Accepts sources: magicbricks, 99acres, commonfloor, housing, website,
     google_ads, facebook, instagram, referral, walk_in.
     """
-    allowed = {"magicbricks", "99acres", "commonfloor", "housing", "website", "jagathi_website", "google_ads", "facebook", "instagram", "referral", "walk_in"}
+    allowed = {"magicbricks", "99acres", "commonfloor", "housing", "website", "jagathi_website", "google_ads", "facebook", "instagram", "google_sheets", "referral", "walk_in"}
     if source not in allowed:
         raise HTTPException(status_code=400, detail=f"Unknown source '{source}'")
     lead = await _ingest_lead_from_payload(source, payload)
@@ -5836,7 +5929,7 @@ async def import_leads(body: ImportBody, actor: dict = Depends(require_roles("ad
         doc = {
             "id": new_id(), "organization_id": organization_id, "name": row.name.strip(),
             "phone": row.phone, "email": row.email,
-            "source": row.source if row.source in ("magicbricks", "99acres", "commonfloor", "housing", "website", "jagathi_website", "google_ads", "facebook", "instagram", "referral", "walk_in", "manual") else "manual",
+            "source": row.source if row.source in ("magicbricks", "99acres", "commonfloor", "housing", "website", "jagathi_website", "google_ads", "facebook", "instagram", "google_sheets", "referral", "walk_in", "manual") else "manual",
             "project_id": projects.get((row.project_name or "").strip().lower()),
             "budget_min": row.budget_min, "budget_max": row.budget_max,
             "configuration": row.configuration, "location_pref": row.location_pref,
