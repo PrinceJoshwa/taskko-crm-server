@@ -3500,6 +3500,11 @@ class UpdateSelfBody(BaseDoc):
     password: Optional[str] = None
 
 
+class ChangePasswordBody(BaseDoc):
+    current_password: str = Field(min_length=1, max_length=128)
+    new_password: str = Field(min_length=8, max_length=128)
+
+
 @api.patch("/users/me")
 async def update_self(body: UpdateSelfBody, actor: dict = Depends(get_current_user)):
     update = {k: v for k, v in body.model_dump(exclude_none=True).items() if k != "password"}
@@ -3509,6 +3514,19 @@ async def update_self(body: UpdateSelfBody, actor: dict = Depends(get_current_us
         raise HTTPException(status_code=400, detail="Nothing to update")
     await db.users.update_one({"id": actor["id"]}, {"$set": update})
     return sanitize_contact_doc(await db.users.find_one({"id": actor["id"]}, {"password_hash": 0, "_id": 0}), actor)
+
+
+@api.post("/users/me/password")
+async def change_own_password(body: ChangePasswordBody, actor: dict = Depends(get_current_user)):
+    """Allow a signed-in user to change their password after verifying the old one."""
+    stored_user = await db.users.find_one({"id": actor["id"]}, {"password_hash": 1, "_id": 0})
+    if not stored_user or not verify_password(body.current_password, stored_user.get("password_hash", "")):
+        raise HTTPException(status_code=400, detail="Current password is incorrect")
+    if verify_password(body.new_password, stored_user.get("password_hash", "")):
+        raise HTTPException(status_code=400, detail="Choose a password different from your current password")
+    await db.users.update_one({"id": actor["id"]}, {"$set": {"password_hash": hash_password(body.new_password)}})
+    await log_activity(None, actor, "password_changed", "Updated account password", {"organization_id": actor.get("organization_id")})
+    return {"ok": True}
 
 
 @api.patch("/users/{user_id}")
