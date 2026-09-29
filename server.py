@@ -2688,6 +2688,7 @@ load_dotenv(ROOT_DIR / ".env")
 
 import os
 import re
+import html
 import logging
 import secrets
 import uuid
@@ -8015,6 +8016,237 @@ async def send_eod_email_to_admins(organization_id: Optional[str] = None) -> dic
     return {"sent": sent, "errors": errors}
 
 
+def _rrl_report_day_window(target_date: Optional[datetime] = None) -> tuple[datetime, datetime, str]:
+    """Return the IST calendar-day window used by the RRL daily report."""
+    instant = target_date or now_utc()
+    if instant.tzinfo is None:
+        instant = instant.replace(tzinfo=timezone.utc)
+    local = instant.astimezone(IST)
+    day_start = datetime(local.year, local.month, local.day, tzinfo=IST)
+    return day_start.astimezone(timezone.utc), (day_start + timedelta(days=1)).astimezone(timezone.utc), day_start.date().isoformat()
+
+
+async def get_rrl_organization() -> dict:
+    """Resolve RRL explicitly so this report can never fall back to another organisation."""
+    configured_id = os.environ.get("RRL_ORGANIZATION_ID", "").strip()
+    if configured_id:
+        organization = await db.organizations.find_one({"id": configured_id, "active": {"$ne": False}}, {"_id": 0})
+        if not organization:
+            raise RuntimeError("RRL_ORGANIZATION_ID does not identify an active organisation")
+        return organization
+
+    matches = await db.organizations.find({
+        "active": {"$ne": False},
+        "$or": [
+            {"slug": {"$regex": r"^rrl(?:[-_].*)?$", "$options": "i"}},
+            {"name": {"$regex": r"\brrl\b", "$options": "i"}},
+        ],
+    }, {"_id": 0}).to_list(2)
+    if len(matches) != 1:
+        raise RuntimeError("Set RRL_ORGANIZATION_ID to the single active RRL organisation before sending reports")
+    return matches[0]
+
+
+async def compute_rrl_daily_report(target_date: Optional[datetime] = None) -> dict:
+    """Compute the RRL-only report. Every source query is constrained by organisation_id."""
+    organization = await get_rrl_organization()
+    organization_id = organization["id"]
+    day_start, day_end, report_date = _rrl_report_day_window(target_date)
+    start_iso, end_iso, now_iso = day_start.isoformat(), day_end.isoformat(), now_utc().isoformat()
+    scope = {"organization_id": organization_id}
+    call_kinds = ["outgoing_call", "incoming_call", "missed_call", "call"]
+
+    new_leads, bookings, site_visits_completed, pending_followups, overdue_followups = await asyncio.gather(
+        db.leads.count_documents({**scope, "created_at": {"$gte": start_iso, "$lt": end_iso}}),
+        db.leads.count_documents({**scope, "stage": "booked", "updated_at": {"$gte": start_iso, "$lt": end_iso}}),
+        db.site_visits.count_documents({**scope, "status": "completed", "scheduled_at": {"$gte": start_iso, "$lt": end_iso}}),
+        db.follow_ups.count_documents({**scope, "status": "pending", "due_at": {"$gte": start_iso, "$lt": end_iso}}),
+        db.follow_ups.count_documents({**scope, "status": "pending", "due_at": {"$lt": now_iso}}),
+    )
+
+    call_match = {**scope, "kind": {"$in": call_kinds}, "created_at": {"$gte": start_iso, "$lt": end_iso}}
+    call_pipeline = [
+        {"$match": call_match},
+        {"$group": {
+            "_id": None,
+            "outgoing": {"$sum": {"$cond": [{"$eq": ["$meta.direction", "outgoing"]}, 1, 0]}},
+            "connected": {"$sum": {"$cond": [{"$in": ["$meta.disposition", ["connected", "completed", "answered"]]}, 1, 0]}},
+            "missed": {"$sum": {"$cond": [{"$in": ["$kind", ["missed_call"]]}, 1, 0]}},
+            "talk_time_sec": {"$sum": {"$ifNull": ["$meta.duration_sec", 0]}},
+        }},
+    ]
+    calls_row = await db.activities.aggregate(call_pipeline).to_list(1)
+    calls = (calls_row or [{}])[0]
+
+    executive_ids = await db.users.find({**scope, "role": "executive", "active": {"$ne": False}}, {"_id": 0, "id": 1, "name": 1}).to_list(500)
+    executive_names = {user["id"]: user.get("name") or "Executive" for user in executive_ids}
+    top_executives = []
+    if executive_names:
+        activity_pipeline = [
+            {"$match": {**call_match, "actor_id": {"$in": list(executive_names)}}},
+            {"$group": {
+                "_id": "$actor_id",
+                "outgoing_calls": {"$sum": {"$cond": [{"$eq": ["$meta.direction", "outgoing"]}, 1, 0]}},
+                "connected_calls": {"$sum": {"$cond": [{"$in": ["$meta.disposition", ["connected", "completed", "answered"]]}, 1, 0]}},
+                "missed_calls": {"$sum": {"$cond": [{"$eq": ["$kind", "missed_call"]}, 1, 0]}},
+                "talk_time_sec": {"$sum": {"$ifNull": ["$meta.duration_sec", 0]}},
+                "activity_count": {"$sum": 1},
+            }},
+            {"$sort": {"activity_count": -1, "talk_time_sec": -1}},
+            {"$limit": 5},
+        ]
+        rows = await db.activities.aggregate(activity_pipeline).to_list(5)
+        top_executives = [{
+            "name": executive_names[row["_id"]],
+            "activity_count": row["activity_count"],
+            "outgoing_calls": row["outgoing_calls"],
+            "connected_calls": row["connected_calls"],
+            "missed_calls": row["missed_calls"],
+            "talk_time_sec": int(row["talk_time_sec"] or 0),
+        } for row in rows]
+
+    return {
+        "organization_id": organization_id,
+        "organization_name": organization.get("name", "RRL"),
+        "report_date": report_date,
+        "generated_at": now_utc().isoformat(),
+        "new_leads": new_leads,
+        "bookings": bookings,
+        "completed_site_visits": site_visits_completed,
+        "calls": {
+            "outgoing": calls.get("outgoing", 0),
+            "connected": calls.get("connected", 0),
+            "missed": calls.get("missed", 0),
+            "talk_time_sec": int(calls.get("talk_time_sec", 0) or 0),
+        },
+        "followups": {"pending": pending_followups, "overdue": overdue_followups},
+        "top_executives": top_executives,
+    }
+
+
+def _rrl_daily_report_html(report: dict) -> str:
+    """Render only the scoped RRL report fields; no organisation names or data are interpolated."""
+    executive_rows = "".join(
+        "<tr><td style='padding:8px 12px;border-top:1px solid #E6E4DD;'>{}</td>"
+        "<td style='padding:8px 12px;border-top:1px solid #E6E4DD;text-align:right;'>{}</td>"
+        "<td style='padding:8px 12px;border-top:1px solid #E6E4DD;text-align:right;'>{}</td>"
+        "<td style='padding:8px 12px;border-top:1px solid #E6E4DD;text-align:right;'>{}</td>"
+        "<td style='padding:8px 12px;border-top:1px solid #E6E4DD;text-align:right;'>{}</td></tr>".format(
+            html.escape(row["name"]), row["activity_count"], row["connected_calls"], row["missed_calls"], _fmt_hms(row["talk_time_sec"])
+        )
+        for row in report["top_executives"]
+    ) or "<tr><td colspan='5' style='padding:12px;color:#5C6661;text-align:center;'>No executive call activity today.</td></tr>"
+    calls = report["calls"]
+    followups = report["followups"]
+    return f"""<div style=\"font-family:Arial,sans-serif;max-width:640px;margin:0 auto;background:#F6F1E8;padding:32px;color:#102A20;\">
+<div style=\"letter-spacing:0.18em;font-size:11px;text-transform:uppercase;color:#5C6661;\">RRL Projects · Daily report</div>
+<h1 style=\"font-size:28px;margin:8px 0 4px;\">End of day report</h1>
+<div style=\"color:#5C6661;font-size:14px;\">{report['report_date']} · RRL organisation only</div>
+<table style=\"width:100%;margin-top:24px;border-collapse:collapse;background:#fff;border:1px solid #E6E4DD;\"><tr>
+<td style=\"padding:16px;\"><b>New leads</b><div style=\"font-size:28px;\">{report['new_leads']}</div></td>
+<td style=\"padding:16px;\"><b>Bookings</b><div style=\"font-size:28px;\">{report['bookings']}</div></td>
+<td style=\"padding:16px;\"><b>Completed visits</b><div style=\"font-size:28px;\">{report['completed_site_visits']}</div></td>
+</tr></table>
+<table style=\"width:100%;margin-top:16px;border-collapse:collapse;background:#fff;border:1px solid #E6E4DD;\"><tr>
+<td style=\"padding:16px;\"><b>Outgoing calls</b><div>{calls['outgoing']}</div></td><td style=\"padding:16px;\"><b>Connected</b><div>{calls['connected']}</div></td><td style=\"padding:16px;\"><b>Missed</b><div>{calls['missed']}</div></td><td style=\"padding:16px;\"><b>Talk time</b><div>{_fmt_hms(calls['talk_time_sec'])}</div></td>
+</tr></table>
+<div style=\"margin-top:16px;padding:16px;background:#fff;border:1px solid #E6E4DD;\"><b>Follow-ups</b><div style=\"margin-top:6px;\">Pending: <strong>{followups['pending']}</strong> · Overdue: <strong>{followups['overdue']}</strong></div></div>
+<div style=\"margin-top:16px;background:#fff;border:1px solid #E6E4DD;\"><div style=\"padding:12px 16px;border-bottom:1px solid #E6E4DD;\"><b>Top executive activity</b></div><table style=\"width:100%;border-collapse:collapse;font-size:13px;\"><thead><tr><th style=\"padding:8px 12px;text-align:left;\">Executive</th><th style=\"padding:8px 12px;text-align:right;\">Activities</th><th style=\"padding:8px 12px;text-align:right;\">Connected</th><th style=\"padding:8px 12px;text-align:right;\">Missed</th><th style=\"padding:8px 12px;text-align:right;\">Talk time</th></tr></thead><tbody>{executive_rows}</tbody></table></div>
+</div>"""
+
+
+async def send_rrl_daily_report() -> dict:
+    """Deliver one RRL-only report to each active RRL admin, recording every send."""
+    report = await compute_rrl_daily_report()
+    organization_id = report["organization_id"]
+    admins = await db.users.find({
+        "organization_id": organization_id,
+        "role": "admin",
+        "active": {"$ne": False},
+        "email": {"$type": "string", "$ne": ""},
+    }, {"_id": 0, "id": 1, "email": 1}).to_list(100)
+    if not admins:
+        return {"sent": 0, "skipped": 0, "errors": [], "report_date": report["report_date"], "reason": "no active RRL admins"}
+
+    settings = await get_integration_settings(organization_id)
+    sender = settings.get("resend_from_email") or SENDER_EMAIL
+    subject = f"RRL Projects · End of day report · {report['report_date']}"
+    html_body = _rrl_daily_report_html(report)
+    sent = skipped = 0
+    errors = []
+    for admin in admins:
+        existing = await db.rrl_daily_report_deliveries.find_one({
+            "organization_id": organization_id,
+            "admin_id": admin["id"],
+            "report_date": report["report_date"],
+            "status": "sent",
+        }, {"_id": 0, "id": 1})
+        if existing:
+            skipped += 1
+            continue
+        try:
+            params = {"from": sender, "to": [admin["email"]], "subject": subject, "html": html_body}
+            if not resend or not resend.api_key:
+                raise RuntimeError("Resend is not configured")
+            response = await asyncio.to_thread(resend.Emails.send, params)
+            resend_email_id = response.get("id") if isinstance(response, dict) else None
+            await db.rrl_daily_report_deliveries.update_one(
+                {"organization_id": organization_id, "admin_id": admin["id"], "report_date": report["report_date"]},
+                {"$set": {
+                    "id": new_id(), "organization_id": organization_id, "admin_id": admin["id"],
+                    "recipient_email": admin["email"], "report_date": report["report_date"],
+                    "resend_email_id": resend_email_id, "status": "sent", "sender_email": sender,
+                    "sent_at": now_utc().isoformat(),
+                }},
+                upsert=True,
+            )
+            sent += 1
+        except Exception as exc:
+            log.warning("RRL daily report failed for admin %s: %s", admin["id"], exc)
+            await db.rrl_daily_report_deliveries.update_one(
+                {"organization_id": organization_id, "admin_id": admin["id"], "report_date": report["report_date"]},
+                {"$set": {
+                    "id": new_id(), "organization_id": organization_id, "admin_id": admin["id"],
+                    "recipient_email": admin["email"], "report_date": report["report_date"],
+                    "resend_email_id": None, "status": "failed", "sender_email": sender,
+                    "failed_at": now_utc().isoformat(), "error": str(exc),
+                }},
+                upsert=True,
+            )
+            errors.append({"admin_id": admin["id"], "error": str(exc)})
+    return {"sent": sent, "skipped": skipped, "errors": errors, "report_date": report["report_date"], "organization_id": organization_id}
+
+
+async def _require_rrl_report_access(user: dict) -> None:
+    organization = await get_rrl_organization()
+    if user.get("role") != "super_admin" and user.get("organization_id") != organization["id"]:
+        raise HTTPException(status_code=403, detail="RRL report access is restricted to RRL admins")
+    if user.get("role") == "super_admin" and user.get("active_organization_id") not in (None, organization["id"]):
+        raise HTTPException(status_code=403, detail="Select RRL before accessing the RRL report")
+
+
+@api.get("/admin/rrl-daily-report")
+async def rrl_daily_report_preview(user: dict = Depends(require_roles("admin"))):
+    await _require_rrl_report_access(user)
+    return await compute_rrl_daily_report()
+
+
+@api.post("/admin/rrl-daily-report/send")
+async def rrl_daily_report_manual_send(user: dict = Depends(require_roles("admin"))):
+    """Manual, RRL-admin-only send used to validate delivery before scheduling."""
+    await _require_rrl_report_access(user)
+    return await send_rrl_daily_report()
+
+
+@api.post("/jobs/rrl-daily-report")
+async def rrl_daily_report_scheduled_job(request: Request):
+    """Scheduled target. Vercel Cron must provide the configured CRON_SECRET bearer token."""
+    cron_secret = os.environ.get("CRON_SECRET", "")
+    if not cron_secret or request.headers.get("Authorization", "") != f"Bearer {cron_secret}":
+        raise HTTPException(status_code=401, detail="Unauthorized job request")
+    return await send_rrl_daily_report()
+
+
 @api.get("/admin/eod-summary")
 async def admin_eod_summary(user: dict = Depends(require_roles("admin"))):
     organization_id = None if user.get("role") == "super_admin" else user.get("organization_id")
@@ -8437,6 +8669,7 @@ async def on_startup():
             db.notifications.create_index([("user_id", 1), ("created_at", -1)]),
             db.notifications.create_index([("role_scope", 1), ("created_at", -1)]),
             db.notifications.create_index("dedupe_key"),
+            db.rrl_daily_report_deliveries.create_index([("organization_id", 1), ("admin_id", 1), ("report_date", 1)], unique=True),
             return_exceptions=True
         )
     except Exception as e:
