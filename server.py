@@ -7570,7 +7570,7 @@ async def import_units(body: UnitImportBody, actor: dict = Depends(require_roles
     supports_built_up_area = await _organization_has_built_up_area(scope.get("organization_id"))
     status_aliases = {
         "available": "available", "avail": "available", "vacant": "available",
-        "held": "held", "hold": "held", "on hold": "held",
+        "held": "held", "hold": "held", "on hold": "held", "unavailable": "held", "not available": "held", "notavailable": "held",
         "booked": "booked", "book": "booked", "reserved": "booked",
         "sold": "sold", "sold out": "sold", "soldout": "sold",
     }
