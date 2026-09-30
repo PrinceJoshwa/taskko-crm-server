@@ -7550,7 +7550,9 @@ class UnitImportRow(BaseDoc):
     built_up_area: Optional[float] = None
     price: Optional[float] = None
     facing: Optional[str] = None
-    status: Optional[UnitStatus] = "available"
+    # CSV exports frequently use labels such as "Available" or "On hold".
+    # Normalize them in the import endpoint instead of rejecting the whole file.
+    status: Optional[str] = "available"
 
 
 class UnitImportBody(BaseDoc):
@@ -7566,23 +7568,45 @@ async def import_units(body: UnitImportBody, actor: dict = Depends(require_roles
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
     supports_built_up_area = await _organization_has_built_up_area(scope.get("organization_id"))
-    if body.replace_existing:
+    status_aliases = {
+        "available": "available", "avail": "available", "vacant": "available",
+        "held": "held", "hold": "held", "on hold": "held",
+        "booked": "booked", "book": "booked", "reserved": "booked",
+        "sold": "sold", "sold out": "sold", "soldout": "sold",
+    }
+    prepared, errors = [], []
+    for index, row in enumerate(body.rows):
+        doc = row.model_dump()
+        status_key = re.sub(r"[\s_-]+", " ", str(doc.get("status") or "available").strip().lower())
+        status = status_aliases.get(status_key)
+        if not status:
+            errors.append({"row": index + 2, "message": f"Invalid status '{doc.get('status')}'"})
+            continue
+        doc["tower"] = doc["tower"].strip()
+        doc["unit_no"] = doc["unit_no"].strip()
+        doc["config"] = doc["config"].strip()
+        if not doc["tower"] or not doc["unit_no"] or not doc["config"]:
+            errors.append({"row": index + 2, "message": "Tower, unit number, and configuration are required"})
+            continue
+        doc["status"] = status
+        doc["id"] = new_id()
+        doc["project_id"] = body.project_id
+        doc["organization_id"] = scope["organization_id"]
+        if not supports_built_up_area:
+            doc.pop("built_up_area", None)
+        doc["created_at"] = now_utc().isoformat()
+        prepared.append(doc)
+    if body.replace_existing and prepared:
         await db.units.delete_many({"project_id": body.project_id, **scope})
-    created, failed = 0, 0
-    for r in body.rows:
+    created, failed = 0, len(errors)
+    for doc in prepared:
         try:
-            doc = r.model_dump()
-            doc["id"] = new_id()
-            doc["project_id"] = body.project_id
-            doc["organization_id"] = scope["organization_id"]
-            if not supports_built_up_area:
-                doc.pop("built_up_area", None)
-            doc["created_at"] = now_utc().isoformat()
             await db.units.insert_one(doc)
             created += 1
-        except Exception:
+        except Exception as exc:
             failed += 1
-    return {"created": created, "failed": failed, "replaced": body.replace_existing}
+            errors.append({"row": None, "message": str(exc)[:160]})
+    return {"created": created, "failed": failed, "replaced": body.replace_existing and bool(prepared), "errors": errors[:10]}
 
 
 
