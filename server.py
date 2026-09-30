@@ -7599,12 +7599,14 @@ async def import_units(body: UnitImportBody, actor: dict = Depends(require_roles
     if body.replace_existing and prepared:
         await db.units.delete_many({"project_id": body.project_id, **scope})
     created, failed = 0, len(errors)
-    for doc in prepared:
+    if prepared:
         try:
-            await db.units.insert_one(doc)
-            created += 1
+            await db.units.insert_many(prepared, ordered=False)
+            created = len(prepared)
         except Exception as exc:
-            failed += 1
+            details = getattr(exc, "details", {}) or {}
+            created = int(details.get("nInserted", 0))
+            failed += len(prepared) - created
             errors.append({"row": None, "message": str(exc)[:160]})
     return {"created": created, "failed": failed, "replaced": body.replace_existing and bool(prepared), "errors": errors[:10]}
 
