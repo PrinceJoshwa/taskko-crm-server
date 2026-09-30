@@ -3671,6 +3671,20 @@ async def _remove_duplicate_units(project_id: str, scope: dict) -> int:
     return result.deleted_count
 
 
+async def _repair_imported_unit_floors(project_id: str, scope: dict) -> int:
+    """Repair early CSV imports where named floors were parsed as zero."""
+    rows = await db.units.find({"project_id": project_id, "floor": 0, **scope}, {"_id": 0, "id": 1, "unit_no": 1}).to_list(2000)
+    operations = []
+    for unit in rows:
+        match = re.search(r"-(\d)", str(unit.get("unit_no") or ""))
+        if match and int(match.group(1)) > 0:
+            operations.append(UpdateOne({"id": unit["id"], "project_id": project_id, **scope}, {"$set": {"floor": int(match.group(1))}}))
+    if not operations:
+        return 0
+    result = await db.units.bulk_write(operations, ordered=False)
+    return result.modified_count
+
+
 @api.get("/units")
 async def list_units(project_id: Optional[str] = None, user: dict = Depends(get_current_user)):
     q = organization_scope(user)
@@ -3685,6 +3699,7 @@ async def list_units(project_id: Optional[str] = None, user: dict = Depends(get_
                 {"project_id": project_id, "$or": [{"organization_id": {"$exists": False}}, {"organization_id": None}]},
                 {"$set": {"organization_id": organization_id}},
             )
+        await _repair_imported_unit_floors(project_id, q)
         await _remove_duplicate_units(project_id, q)
         q["project_id"] = project_id
     docs = await db.units.find(q, {"_id": 0}).sort([("tower", 1), ("floor", 1), ("unit_no", 1)]).to_list(2000)
@@ -7590,6 +7605,7 @@ async def import_units(body: UnitImportBody, actor: dict = Depends(require_roles
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
     supports_built_up_area = await _organization_has_built_up_area(scope.get("organization_id"))
+    await _repair_imported_unit_floors(body.project_id, scope)
     await _remove_duplicate_units(body.project_id, scope)
     status_aliases = {
         "available": "available", "avail": "available", "vacant": "available",
