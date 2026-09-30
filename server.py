@@ -2711,6 +2711,7 @@ from googleapiclient.discovery import build as google_build
 from fastapi import FastAPI, APIRouter, Depends, HTTPException, Request, Response, status, Query, UploadFile, File, Form
 from starlette.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
+from pymongo import UpdateOne
 from pydantic import BaseModel, Field, EmailStr, ConfigDict
 
 
@@ -3650,6 +3651,26 @@ async def delete_project(project_id: str, actor: dict = Depends(require_roles("a
 # ---------------------------------------------------------------------------
 # INVENTORY / UNITS
 # ---------------------------------------------------------------------------
+async def _remove_duplicate_units(project_id: str, scope: dict) -> int:
+    """Keep the newest copy of a unit after an interrupted/retried import."""
+    pipeline = [
+        {"$match": {"project_id": project_id, **scope}},
+        {"$sort": {"created_at": -1, "_id": -1}},
+        {"$group": {
+            "_id": {"tower": "$tower", "floor": "$floor", "unit_no": "$unit_no"},
+            "ids": {"$push": "$id"},
+            "count": {"$sum": 1},
+        }},
+        {"$match": {"count": {"$gt": 1}}},
+    ]
+    groups = await db.units.aggregate(pipeline).to_list(2000)
+    duplicate_ids = [unit_id for group in groups for unit_id in group["ids"][1:] if unit_id]
+    if not duplicate_ids:
+        return 0
+    result = await db.units.delete_many({"id": {"$in": duplicate_ids}, "project_id": project_id, **scope})
+    return result.deleted_count
+
+
 @api.get("/units")
 async def list_units(project_id: Optional[str] = None, user: dict = Depends(get_current_user)):
     q = organization_scope(user)
@@ -3664,6 +3685,7 @@ async def list_units(project_id: Optional[str] = None, user: dict = Depends(get_
                 {"project_id": project_id, "$or": [{"organization_id": {"$exists": False}}, {"organization_id": None}]},
                 {"$set": {"organization_id": organization_id}},
             )
+        await _remove_duplicate_units(project_id, q)
         q["project_id"] = project_id
     docs = await db.units.find(q, {"_id": 0}).sort([("tower", 1), ("floor", 1), ("unit_no", 1)]).to_list(2000)
     return docs
@@ -7568,6 +7590,7 @@ async def import_units(body: UnitImportBody, actor: dict = Depends(require_roles
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
     supports_built_up_area = await _organization_has_built_up_area(scope.get("organization_id"))
+    await _remove_duplicate_units(body.project_id, scope)
     status_aliases = {
         "available": "available", "avail": "available", "vacant": "available",
         "held": "held", "hold": "held", "on hold": "held", "unavailable": "held", "not available": "held", "notavailable": "held",
@@ -7598,17 +7621,30 @@ async def import_units(body: UnitImportBody, actor: dict = Depends(require_roles
         prepared.append(doc)
     if body.replace_existing and prepared:
         await db.units.delete_many({"project_id": body.project_id, **scope})
-    created, failed = 0, len(errors)
+    created, updated, failed = 0, 0, len(errors)
     if prepared:
         try:
-            await db.units.insert_many(prepared, ordered=False)
-            created = len(prepared)
+            operations = []
+            for doc in prepared:
+                identity = {
+                    "project_id": body.project_id,
+                    "organization_id": scope["organization_id"],
+                    "tower": doc["tower"],
+                    "floor": doc["floor"],
+                    "unit_no": doc["unit_no"],
+                }
+                values = {key: value for key, value in doc.items() if key != "id"}
+                operations.append(UpdateOne(identity, {"$set": values, "$setOnInsert": {"id": doc["id"]}}, upsert=True))
+            result = await db.units.bulk_write(operations, ordered=False)
+            created = result.upserted_count
+            updated = result.matched_count
         except Exception as exc:
             details = getattr(exc, "details", {}) or {}
-            created = int(details.get("nInserted", 0))
-            failed += len(prepared) - created
+            created = int(details.get("nUpserted", 0))
+            updated = int(details.get("nMatched", 0))
+            failed += len(prepared) - created - updated
             errors.append({"row": None, "message": str(exc)[:160]})
-    return {"created": created, "failed": failed, "replaced": body.replace_existing and bool(prepared), "errors": errors[:10]}
+    return {"created": created, "updated": updated, "failed": failed, "replaced": body.replace_existing and bool(prepared), "errors": errors[:10]}
 
 
 
