@@ -50,16 +50,22 @@ function syncPropzelLeads() {
   const values = sheet.getDataRange().getDisplayValues();
   if (values.length < 2) return;
 
-  const headers = values[0].map(normalizeHeader);
-  const statusColumn = ensureColumn(sheet, headers, "Propzel Sync Status");
-  const leadIdColumn = ensureColumn(sheet, headers, "Propzel Lead ID");
-  const rowKeyColumn = ensureColumn(sheet, headers, "Propzel Row Key");
-  const syncedAtColumn = ensureColumn(sheet, headers, "Propzel Synced At");
+  const headerRowIndex = findHeaderRow(values);
+  if (headerRowIndex === -1) {
+    throw new Error("Could not find a lead header row. Include a Name/Full Name or Phone/Mobile column.");
+  }
+  const headers = values[headerRowIndex].map(normalizeHeader);
+  const headerRowNumber = headerRowIndex + 1;
+  const statusColumn = ensureColumn(sheet, headers, "Propzel Sync Status", headerRowNumber);
+  const leadIdColumn = ensureColumn(sheet, headers, "Propzel Lead ID", headerRowNumber);
+  const rowKeyColumn = ensureColumn(sheet, headers, "Propzel Row Key", headerRowNumber);
+  const syncedAtColumn = ensureColumn(sheet, headers, "Propzel Synced At", headerRowNumber);
   const updatedValues = sheet.getDataRange().getDisplayValues();
-  const updatedHeaders = updatedValues[0].map(normalizeHeader);
+  const updatedHeaders = updatedValues[headerRowIndex].map(normalizeHeader);
 
-  for (let rowIndex = 1; rowIndex < updatedValues.length; rowIndex += 1) {
+  for (let rowIndex = headerRowIndex + 1; rowIndex < updatedValues.length; rowIndex += 1) {
     const row = updatedValues[rowIndex];
+    if (!row.some((cell) => String(cell).trim())) continue;
     const currentStatus = row[statusColumn - 1];
     if (currentStatus === "Synced") continue;
 
@@ -108,9 +114,9 @@ function rowToLead(headers, row) {
     return "";
   };
   return {
-    name: value("name", "full name", "customer name"),
-    phone: value("phone", "mobile", "mobile number", "contact number") || null,
-    email: value("email", "email address") || null,
+    name: value("name", "full name", "full_name", "customer name", "lead name"),
+    phone: value("phone", "phone number", "phone_number", "mobile", "mobile number", "contact number", "whatsapp number") || null,
+    email: value("email", "email address", "email_address") || null,
     project_name: value("project", "project name") || null,
     budget_min: numberOrNull(value("budget min", "minimum budget", "budget")),
     budget_max: numberOrNull(value("budget max", "maximum budget")),
@@ -120,12 +126,31 @@ function rowToLead(headers, row) {
   };
 }
 
-function ensureColumn(sheet, headers, title) {
+function findHeaderRow(values) {
+  const expectedHeaders = [
+    "name", "full name", "full_name", "customer name", "phone", "phone number", "phone_number",
+    "mobile", "email", "email address", "created time", "created_time", "leadgen id", "leadgen_id",
+  ].map(normalizeHeader);
+  const scanLimit = Math.min(values.length, 20);
+  let bestRow = -1;
+  let bestScore = 0;
+  for (let rowIndex = 0; rowIndex < scanLimit; rowIndex += 1) {
+    const normalized = values[rowIndex].map(normalizeHeader);
+    const score = normalized.filter((value) => expectedHeaders.includes(value)).length;
+    if (score > bestScore) {
+      bestRow = rowIndex;
+      bestScore = score;
+    }
+  }
+  return bestScore > 0 ? bestRow : -1;
+}
+
+function ensureColumn(sheet, headers, title, headerRowNumber) {
   const normalizedTitle = normalizeHeader(title);
   const existing = headers.indexOf(normalizedTitle);
   if (existing !== -1) return existing + 1;
   const column = headers.length + 1;
-  sheet.getRange(1, column).setValue(title);
+  sheet.getRange(headerRowNumber, column).setValue(title);
   headers.push(normalizedTitle);
   return column;
 }
