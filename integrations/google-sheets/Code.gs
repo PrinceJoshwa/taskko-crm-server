@@ -113,8 +113,12 @@ function rowToLead(headers, row) {
     }
     return "";
   };
+  const leadReference = value("leadgen id", "leadgen_id", "id");
+  const name = value("name", "full name", "full_name", "customer name", "lead name") || (leadReference ? "Facebook lead " + leadReference : "");
   return {
-    name: value("name", "full name", "full_name", "customer name", "lead name"),
+    // Facebook exports can omit contact answers for some form submissions.
+    // Keep those leads visible in Propzel with a traceable lead-ID fallback.
+    name,
     phone: value("phone", "phone number", "phone_number", "mobile", "mobile number", "contact number", "whatsapp number") || null,
     email: value("email", "email address", "email_address") || null,
     project_name: value("project", "project name") || null,
