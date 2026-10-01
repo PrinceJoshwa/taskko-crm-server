@@ -3975,6 +3975,21 @@ async def ingest_google_sheet_lead(
         {"_id": 0, "id": 1},
     )
     if existing:
+        # Earlier versions of the sheet script could create a traceable fallback
+        # name before the Facebook column mapping was corrected. Repair only those
+        # generated records on a later sync; do not overwrite CRM-edited leads.
+        if str(existing.get("name") or "").startswith("Facebook lead "):
+            repair_fields = {
+                "name": body.name.strip(),
+                "phone": body.phone,
+                "email": str(body.email) if body.email else None,
+                "updated_at": now_utc().isoformat(),
+            }
+            await db.leads.update_one(
+                {"id": existing["id"], "organization_id": organization_id},
+                {"$set": repair_fields},
+            )
+            return {"ok": True, "created": False, "updated": True, "lead_id": existing["id"]}
         return {"ok": True, "created": False, "lead_id": existing["id"]}
 
     project_id = None
