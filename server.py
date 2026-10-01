@@ -2706,9 +2706,11 @@ from typing import Optional, List, Literal
 
 import bcrypt
 import jwt
-from google.oauth2 import service_account
+from google.oauth2.credentials import Credentials as GoogleOAuthCredentials
+from google.auth.transport.requests import Request as GoogleAuthRequest
 from googleapiclient.discovery import build as google_build
 from fastapi import FastAPI, APIRouter, Depends, HTTPException, Request, Response, status, Query, UploadFile, File, Form
+from fastapi.responses import RedirectResponse
 from starlette.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
 from pymongo import UpdateOne
@@ -4122,49 +4124,167 @@ async def jagathi_channel_partner_webhook(payload: dict):
     return {"ok": True, "lead_id": lead["id"]}
 
 
-async def sync_site_visit_calendar_event(visit: dict, action: str = "upsert") -> dict:
-    settings = await db.settings.find_one({"id": "singleton"}) or {}
-    if not settings.get("google_calendar_enabled"):
-        return {"status": "disabled"}
-    if not settings.get("google_calendar_credentials_json") or not settings.get("google_calendar_id"):
-        return {"status": "pending_credentials", "message": "Google Calendar credentials are not configured"}
-    try:
-        credentials_info = json.loads(settings["google_calendar_credentials_json"])
-        credentials = service_account.Credentials.from_service_account_info(
-            credentials_info,
-            scopes=["https://www.googleapis.com/auth/calendar"],
-        )
-        service = google_build("calendar", "v3", credentials=credentials, cache_discovery=False)
-        calendar_id = settings["google_calendar_id"]
-        event_id = visit.get("google_calendar_event_id")
-        if action == "delete":
-            if event_id:
-                await asyncio.to_thread(service.events().delete(calendarId=calendar_id, eventId=event_id, sendUpdates="all").execute)
-            return {"status": "deleted"}
+GOOGLE_CALENDAR_SCOPE = "https://www.googleapis.com/auth/calendar.events"
+GOOGLE_OAUTH_TOKEN_URL = "https://oauth2.googleapis.com/token"
 
-        lead = await db.leads.find_one({"id": visit.get("lead_id")}, {"_id": 0, "name": 1, "email": 1, "co_assigned_to": 1}) or {}
-        owner_ids = list(dict.fromkeys(owner_ids_for_visit(visit) + (lead.get("co_assigned_to") or [])))
-        owners = await db.users.find({"id": {"$in": owner_ids}}, {"_id": 0, "email": 1, "name": 1}).to_list(100)
-        attendees = [{"email": email} for email in dict.fromkeys([lead.get("email")] + [owner.get("email") for owner in owners]) if email]
+
+def google_calendar_oauth_config() -> tuple[str, str, str]:
+    client_id = os.environ.get("GOOGLE_CLIENT_ID", "").strip()
+    client_secret = os.environ.get("GOOGLE_CLIENT_SECRET", "").strip()
+    backend_url = os.environ.get("BACKEND_PUBLIC_URL", "").rstrip("/")
+    redirect_uri = os.environ.get("GOOGLE_OAUTH_REDIRECT_URI", "").strip() or f"{backend_url}/api/integrations/google-calendar/callback"
+    if not client_id or not client_secret or not backend_url:
+        raise HTTPException(status_code=503, detail="Google Calendar OAuth is not configured")
+    return client_id, client_secret, redirect_uri
+
+
+def calendar_return_url(request: Request) -> str:
+    origin = request.headers.get("origin", "").strip()
+    if origin:
+        parsed = urllib.parse.urlparse(origin)
+        if parsed.scheme in {"https", "http"} and parsed.netloc:
+            return f"{parsed.scheme}://{parsed.netloc}"
+    return os.environ.get("FRONTEND_PUBLIC_URL", "https://app.propzel.tech").rstrip("/")
+
+
+@api.get("/integrations/google-calendar/status")
+async def google_calendar_status(user: dict = Depends(get_current_user)):
+    connection = await db.google_calendar_connections.find_one({"user_id": user["id"]}, {"_id": 0, "connected_email": 1, "created_at": 1})
+    return {"connected": bool(connection), "email": (connection or {}).get("connected_email"), "configured": bool(os.environ.get("GOOGLE_CLIENT_ID") and os.environ.get("GOOGLE_CLIENT_SECRET"))}
+
+
+@api.get("/integrations/google-calendar/connect")
+async def connect_google_calendar(request: Request, user: dict = Depends(get_current_user)):
+    client_id, _, redirect_uri = google_calendar_oauth_config()
+    state = secrets.token_urlsafe(32)
+    await db.google_calendar_oauth_states.insert_one({
+        "state": state,
+        "user_id": user["id"],
+        "return_url": calendar_return_url(request),
+        "expires_at": now_utc() + timedelta(minutes=10),
+    })
+    params = {
+        "client_id": client_id,
+        "redirect_uri": redirect_uri,
+        "response_type": "code",
+        "scope": GOOGLE_CALENDAR_SCOPE,
+        "access_type": "offline",
+        "prompt": "consent",
+        "state": state,
+    }
+    return {"authorization_url": "https://accounts.google.com/o/oauth2/v2/auth?" + urllib.parse.urlencode(params)}
+
+
+@api.get("/integrations/google-calendar/callback")
+async def google_calendar_callback(code: Optional[str] = None, state: Optional[str] = None, error: Optional[str] = None):
+    state_doc = await db.google_calendar_oauth_states.find_one_and_delete({"state": state or ""})
+    return_url = (state_doc or {}).get("return_url", os.environ.get("FRONTEND_PUBLIC_URL", "https://app.propzel.tech")).rstrip("/")
+    if error or not state_doc or state_doc.get("expires_at") < now_utc() or not code:
+        return RedirectResponse(f"{return_url}/?google_calendar=failed", status_code=302)
+
+    client_id, client_secret, redirect_uri = google_calendar_oauth_config()
+    payload = urllib.parse.urlencode({
+        "code": code,
+        "client_id": client_id,
+        "client_secret": client_secret,
+        "redirect_uri": redirect_uri,
+        "grant_type": "authorization_code",
+    }).encode()
+    try:
+        token_response = await asyncio.to_thread(
+            urllib.request.urlopen,
+            urllib.request.Request(GOOGLE_OAUTH_TOKEN_URL, data=payload, headers={"Content-Type": "application/x-www-form-urlencoded"}),
+            timeout=15,
+        )
+        token_data = json.loads(token_response.read().decode())
+        if not token_data.get("refresh_token"):
+            raise ValueError("Google did not return a refresh token")
+        await db.google_calendar_connections.update_one(
+            {"user_id": state_doc["user_id"]},
+            {"$set": {
+                "user_id": state_doc["user_id"],
+                "refresh_token": token_data["refresh_token"],
+                "connected_at": now_utc().isoformat(),
+                "updated_at": now_utc().isoformat(),
+            }},
+            upsert=True,
+        )
+    except Exception as exc:
+        log.warning("Google Calendar OAuth callback failed: %s", exc)
+        return RedirectResponse(f"{return_url}/?google_calendar=failed", status_code=302)
+    return RedirectResponse(f"{return_url}/?google_calendar=connected", status_code=302)
+
+
+@api.delete("/integrations/google-calendar/connection")
+async def disconnect_google_calendar(user: dict = Depends(get_current_user)):
+    await db.google_calendar_connections.delete_one({"user_id": user["id"]})
+    return {"ok": True}
+
+
+async def google_calendar_service_for(user_id: str):
+    connection = await db.google_calendar_connections.find_one({"user_id": user_id}, {"_id": 0})
+    if not connection or not connection.get("refresh_token"):
+        return None
+    client_id, client_secret, _ = google_calendar_oauth_config()
+    credentials = GoogleOAuthCredentials(
+        token=None,
+        refresh_token=connection["refresh_token"],
+        token_uri=GOOGLE_OAUTH_TOKEN_URL,
+        client_id=client_id,
+        client_secret=client_secret,
+        scopes=[GOOGLE_CALENDAR_SCOPE],
+    )
+    try:
+        await asyncio.to_thread(credentials.refresh, GoogleAuthRequest())
+        return google_build("calendar", "v3", credentials=credentials, cache_discovery=False)
+    except Exception as exc:
+        log.warning("Google Calendar token refresh failed for user %s: %s", user_id, exc)
+        return None
+
+
+async def sync_site_visit_calendar_event(visit: dict, action: str = "upsert") -> dict:
+    """One-way site-visit sync to the connected calendars of assigned users."""
+    try:
+        lead = await db.leads.find_one({"id": visit.get("lead_id")}, {"_id": 0, "name": 1, "email": 1}) or {}
+        owner_ids = set(owner_ids_for_visit(visit))
+        event_ids = dict(visit.get("google_calendar_events") or {})
+        target_ids = set(event_ids) if action == "delete" else owner_ids | set(event_ids)
+        updated_event_ids = dict(event_ids)
         start = datetime.fromisoformat(str(visit["scheduled_at"]).replace("Z", "+00:00"))
         event = {
             "summary": f"Site visit: {lead.get('name', 'Lead')}",
-            "description": f"Propzel CRM site visit\\nVisit ID: {visit.get('id')}\\nLead: {lead.get('name', 'Unknown')}",
+            "description": f"Propzel CRM site visit\nVisit ID: {visit.get('id')}\nLead: {lead.get('name', 'Unknown')}\nNotes: {visit.get('notes') or ''}",
             "start": {"dateTime": start.isoformat(), "timeZone": "UTC"},
             "end": {"dateTime": (start + timedelta(hours=1)).isoformat(), "timeZone": "UTC"},
-            "attendees": attendees,
             "reminders": {"useDefault": True},
         }
-        if event_id:
-            result = await asyncio.to_thread(service.events().update(calendarId=calendar_id, eventId=event_id, body=event, sendUpdates="all").execute)
-        else:
-            result = await asyncio.to_thread(service.events().insert(calendarId=calendar_id, body=event, sendUpdates="all").execute)
-            await db.site_visits.update_one({"id": visit["id"]}, {"$set": {"google_calendar_event_id": result["id"]}})
-        await log_activity(visit.get("lead_id"), None, "calendar_synced", f"Google Calendar {action} completed", {"visit_id": visit.get("id"), "event_id": result.get("id")})
-        return {"status": "synced", "event_id": result.get("id")}
+        for user_id in target_ids:
+            service = await google_calendar_service_for(user_id)
+            if not service:
+                continue
+            event_id = event_ids.get(user_id)
+            if action == "delete" or user_id not in owner_ids:
+                if event_id:
+                    try:
+                        await asyncio.to_thread(service.events().delete(calendarId="primary", eventId=event_id).execute)
+                    except Exception as exc:
+                        log.warning("Google Calendar deletion failed for visit %s: %s", visit.get("id"), exc)
+                updated_event_ids.pop(user_id, None)
+                continue
+            try:
+                if event_id:
+                    result = await asyncio.to_thread(service.events().update(calendarId="primary", eventId=event_id, body=event).execute)
+                else:
+                    result = await asyncio.to_thread(service.events().insert(calendarId="primary", body=event).execute)
+                updated_event_ids[user_id] = result["id"]
+            except Exception as exc:
+                log.warning("Google Calendar sync failed for visit %s and user %s: %s", visit.get("id"), user_id, exc)
+        if action != "delete":
+            await db.site_visits.update_one({"id": visit["id"]}, {"$set": {"google_calendar_events": updated_event_ids}})
+        await log_activity(visit.get("lead_id"), None, "calendar_synced", f"Google Calendar {action} completed", {"visit_id": visit.get("id"), "users": list(updated_event_ids)})
+        return {"status": "synced", "users": list(updated_event_ids)}
     except Exception as exc:
         log.warning("Google Calendar sync failed for visit %s: %s", visit.get("id"), exc)
-        await log_activity(visit.get("lead_id"), None, "calendar_sync_failed", "Google Calendar sync failed", {"visit_id": visit.get("id"), "error": str(exc)[:500]})
         return {"status": "failed", "message": "Calendar sync could not be completed"}
 
 
@@ -4234,8 +4354,7 @@ async def update_visit(visit_id: str, body: UpdateSiteVisitBody, actor: dict = D
     v = await db.site_visits.find_one(scoped_id_query(visit_id, actor), {"_id": 0})
     if "status" in update:
         await log_activity(v["lead_id"], actor, "site_visit_" + update["status"], f"Site visit {update['status']}")
-    if any(k in update for k in ("scheduled_at", "status", "presales_owner_id", "sales_owner_id", "project_id")):
-        await sync_site_visit_calendar_event(v)
+    await sync_site_visit_calendar_event(v)
     return sanitize_contact_doc(v, actor)
 
 
@@ -8855,6 +8974,9 @@ async def on_startup():
             db.notifications.create_index([("user_id", 1), ("created_at", -1)]),
             db.notifications.create_index([("role_scope", 1), ("created_at", -1)]),
             db.notifications.create_index("dedupe_key"),
+            db.google_calendar_connections.create_index("user_id", unique=True),
+            db.google_calendar_oauth_states.create_index("state", unique=True),
+            db.google_calendar_oauth_states.create_index("expires_at", expireAfterSeconds=0),
             db.rrl_daily_report_deliveries.create_index([("organization_id", 1), ("admin_id", 1), ("report_date", 1)], unique=True),
             return_exceptions=True
         )
