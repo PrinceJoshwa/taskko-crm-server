@@ -2695,6 +2695,7 @@ import uuid
 import random
 import asyncio
 import base64
+import hashlib
 import json
 import csv
 import io
@@ -2715,6 +2716,7 @@ from starlette.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
 from pymongo import UpdateOne
 from pydantic import BaseModel, Field, EmailStr, ConfigDict
+from cryptography.fernet import Fernet
 
 
 # ---------------------------------------------------------------------------
@@ -2929,6 +2931,7 @@ def owner_ids_for_visit(visit: dict) -> list[str]:
         visit.get("presales_owner_id"),
         visit.get("sales_owner_id"),
         visit.get("assigned_to"),
+        *(visit.get("co_assigned_to") or []),
     ]
     return list(dict.fromkeys([i for i in ids if i]))
 
@@ -3158,6 +3161,7 @@ class UpdateSiteVisitBody(BaseDoc):
     presales_owner_id: Optional[str] = None
     sales_owner_id: Optional[str] = None
     assigned_to: Optional[str] = None
+    co_assigned_to: Optional[List[str]] = None
 
 
 class FollowUpBody(BaseDoc):
@@ -4124,18 +4128,29 @@ async def jagathi_channel_partner_webhook(payload: dict):
     return {"ok": True, "lead_id": lead["id"]}
 
 
-GOOGLE_CALENDAR_SCOPE = "https://www.googleapis.com/auth/calendar.events"
+GOOGLE_CALENDAR_SCOPE = "https://www.googleapis.com/auth/calendar.events.owned"
 GOOGLE_OAUTH_TOKEN_URL = "https://oauth2.googleapis.com/token"
 
 
-def google_calendar_oauth_config() -> tuple[str, str, str]:
+def google_calendar_oauth_config() -> tuple[str, str, str, str]:
     client_id = os.environ.get("GOOGLE_CLIENT_ID", "").strip()
     client_secret = os.environ.get("GOOGLE_CLIENT_SECRET", "").strip()
     backend_url = os.environ.get("BACKEND_PUBLIC_URL", "").rstrip("/")
-    redirect_uri = os.environ.get("GOOGLE_OAUTH_REDIRECT_URI", "").strip() or f"{backend_url}/api/integrations/google-calendar/callback"
-    if not client_id or not client_secret or not backend_url:
+    frontend_url = os.environ.get("FRONTEND_PUBLIC_URL", "").strip().rstrip("/")
+    redirect_uri = f"{backend_url}/api/integrations/google-calendar/callback"
+    if not client_id or not client_secret or not backend_url or not frontend_url:
         raise HTTPException(status_code=503, detail="Google Calendar OAuth is not configured")
-    return client_id, client_secret, redirect_uri
+    return client_id, client_secret, redirect_uri, frontend_url
+
+
+def encrypt_google_refresh_token(token: str) -> str:
+    key = base64.urlsafe_b64encode(hashlib.sha256(JWT_SECRET.encode()).digest())
+    return Fernet(key).encrypt(token.encode()).decode()
+
+
+def decrypt_google_refresh_token(token: str) -> str:
+    key = base64.urlsafe_b64encode(hashlib.sha256(JWT_SECRET.encode()).digest())
+    return Fernet(key).decrypt(token.encode()).decode()
 
 
 def calendar_return_url(request: Request) -> str:
@@ -4149,18 +4164,18 @@ def calendar_return_url(request: Request) -> str:
 
 @api.get("/integrations/google-calendar/status")
 async def google_calendar_status(user: dict = Depends(get_current_user)):
-    connection = await db.google_calendar_connections.find_one({"user_id": user["id"]}, {"_id": 0, "connected_email": 1, "created_at": 1})
-    return {"connected": bool(connection), "email": (connection or {}).get("connected_email"), "configured": bool(os.environ.get("GOOGLE_CLIENT_ID") and os.environ.get("GOOGLE_CLIENT_SECRET"))}
+    connection = await db.google_calendar_connections.find_one({"user_id": user["id"], "organization_id": organization_scope(user).get("organization_id")}, {"_id": 0, "refresh_token_encrypted": 0})
+    return {"connected": bool(connection), "configured": bool(os.environ.get("GOOGLE_CLIENT_ID") and os.environ.get("GOOGLE_CLIENT_SECRET") and os.environ.get("BACKEND_PUBLIC_URL") and os.environ.get("FRONTEND_PUBLIC_URL"))}
 
 
 @api.get("/integrations/google-calendar/connect")
-async def connect_google_calendar(request: Request, user: dict = Depends(get_current_user)):
-    client_id, _, redirect_uri = google_calendar_oauth_config()
+async def connect_google_calendar(user: dict = Depends(get_current_user)):
+    client_id, _, redirect_uri, _ = google_calendar_oauth_config()
     state = secrets.token_urlsafe(32)
     await db.google_calendar_oauth_states.insert_one({
-        "state": state,
+        "id": new_id(), "state_hash": hashlib.sha256(state.encode()).hexdigest(),
         "user_id": user["id"],
-        "return_url": calendar_return_url(request),
+        "organization_id": organization_scope(user).get("organization_id"),
         "expires_at": now_utc() + timedelta(minutes=10),
     })
     params = {
@@ -4177,12 +4192,12 @@ async def connect_google_calendar(request: Request, user: dict = Depends(get_cur
 
 @api.get("/integrations/google-calendar/callback")
 async def google_calendar_callback(code: Optional[str] = None, state: Optional[str] = None, error: Optional[str] = None):
-    state_doc = await db.google_calendar_oauth_states.find_one_and_delete({"state": state or ""})
-    return_url = (state_doc or {}).get("return_url", os.environ.get("FRONTEND_PUBLIC_URL", "https://app.propzel.tech")).rstrip("/")
+    state_doc = await db.google_calendar_oauth_states.find_one_and_delete({"state_hash": hashlib.sha256((state or "").encode()).hexdigest(), "expires_at": {"$gt": now_utc()}})
+    return_url = os.environ.get("FRONTEND_PUBLIC_URL", "").rstrip("/")
     if error or not state_doc or state_doc.get("expires_at") < now_utc() or not code:
         return RedirectResponse(f"{return_url}/?google_calendar=failed", status_code=302)
 
-    client_id, client_secret, redirect_uri = google_calendar_oauth_config()
+    client_id, client_secret, redirect_uri, _ = google_calendar_oauth_config()
     payload = urllib.parse.urlencode({
         "code": code,
         "client_id": client_id,
@@ -4200,10 +4215,11 @@ async def google_calendar_callback(code: Optional[str] = None, state: Optional[s
         if not token_data.get("refresh_token"):
             raise ValueError("Google did not return a refresh token")
         await db.google_calendar_connections.update_one(
-            {"user_id": state_doc["user_id"]},
+            {"user_id": state_doc["user_id"], "organization_id": state_doc["organization_id"]},
             {"$set": {
                 "user_id": state_doc["user_id"],
-                "refresh_token": token_data["refresh_token"],
+                "organization_id": state_doc["organization_id"],
+                "refresh_token_encrypted": encrypt_google_refresh_token(token_data["refresh_token"]),
                 "connected_at": now_utc().isoformat(),
                 "updated_at": now_utc().isoformat(),
             }},
@@ -4215,20 +4231,20 @@ async def google_calendar_callback(code: Optional[str] = None, state: Optional[s
     return RedirectResponse(f"{return_url}/?google_calendar=connected", status_code=302)
 
 
-@api.delete("/integrations/google-calendar/connection")
+@api.delete("/integrations/google-calendar")
 async def disconnect_google_calendar(user: dict = Depends(get_current_user)):
-    await db.google_calendar_connections.delete_one({"user_id": user["id"]})
+    await db.google_calendar_connections.delete_one({"user_id": user["id"], "organization_id": organization_scope(user).get("organization_id")})
     return {"ok": True}
 
 
-async def google_calendar_service_for(user_id: str):
-    connection = await db.google_calendar_connections.find_one({"user_id": user_id}, {"_id": 0})
-    if not connection or not connection.get("refresh_token"):
+async def google_calendar_service_for(user_id: str, organization_id: str):
+    connection = await db.google_calendar_connections.find_one({"user_id": user_id, "organization_id": organization_id}, {"_id": 0})
+    if not connection or not connection.get("refresh_token_encrypted"):
         return None
-    client_id, client_secret, _ = google_calendar_oauth_config()
+    client_id, client_secret, _, _ = google_calendar_oauth_config()
     credentials = GoogleOAuthCredentials(
         token=None,
-        refresh_token=connection["refresh_token"],
+        refresh_token=decrypt_google_refresh_token(connection["refresh_token_encrypted"]),
         token_uri=GOOGLE_OAUTH_TOKEN_URL,
         client_id=client_id,
         client_secret=client_secret,
@@ -4245,8 +4261,8 @@ async def google_calendar_service_for(user_id: str):
 async def sync_site_visit_calendar_event(visit: dict, action: str = "upsert") -> dict:
     """One-way site-visit sync to the connected calendars of assigned users."""
     try:
-        lead = await db.leads.find_one({"id": visit.get("lead_id")}, {"_id": 0, "name": 1, "email": 1}) or {}
-        owner_ids = set(owner_ids_for_visit(visit))
+        lead = await db.leads.find_one({"id": visit.get("lead_id"), "organization_id": visit.get("organization_id")}, {"_id": 0, "name": 1, "email": 1, "co_assigned_to": 1}) or {}
+        owner_ids = set(owner_ids_for_visit(visit)) | set(lead.get("co_assigned_to") or [])
         event_ids = dict(visit.get("google_calendar_events") or {})
         target_ids = set(event_ids) if action == "delete" else owner_ids | set(event_ids)
         updated_event_ids = dict(event_ids)
@@ -4259,7 +4275,7 @@ async def sync_site_visit_calendar_event(visit: dict, action: str = "upsert") ->
             "reminders": {"useDefault": True},
         }
         for user_id in target_ids:
-            service = await google_calendar_service_for(user_id)
+            service = await google_calendar_service_for(user_id, visit.get("organization_id"))
             if not service:
                 continue
             event_id = event_ids.get(user_id)
@@ -8974,8 +8990,8 @@ async def on_startup():
             db.notifications.create_index([("user_id", 1), ("created_at", -1)]),
             db.notifications.create_index([("role_scope", 1), ("created_at", -1)]),
             db.notifications.create_index("dedupe_key"),
-            db.google_calendar_connections.create_index("user_id", unique=True),
-            db.google_calendar_oauth_states.create_index("state", unique=True),
+            db.google_calendar_connections.create_index([("user_id", 1), ("organization_id", 1)], unique=True),
+            db.google_calendar_oauth_states.create_index("state_hash", unique=True),
             db.google_calendar_oauth_states.create_index("expires_at", expireAfterSeconds=0),
             db.rrl_daily_report_deliveries.create_index([("organization_id", 1), ("admin_id", 1), ("report_date", 1)], unique=True),
             return_exceptions=True
