@@ -2834,13 +2834,14 @@ def require_roles(*roles: str):
     return dep
 
 
-def set_auth_cookies(resp: Response, user_id: str, email: str, role: str) -> None:
+def set_auth_cookies(resp: Response, user_id: str, email: str, role: str) -> tuple[str, str]:
     access = create_token(user_id, email, role, "access", ttl_min=60 * 12)
     refresh = create_token(user_id, email, role, "refresh", ttl_min=60 * 24 * 7)
     secure_cookie = os.environ.get("BACKEND_PUBLIC_URL", "").startswith("https://")
     same_site = "none" if secure_cookie else "lax"
     resp.set_cookie("access_token", access, httponly=True, secure=secure_cookie, samesite=same_site, max_age=60 * 60 * 12, path="/")
     resp.set_cookie("refresh_token", refresh, httponly=True, secure=secure_cookie, samesite=same_site, max_age=60 * 60 * 24 * 7, path="/")
+    return access, refresh
 
 
 def clean(doc: dict) -> dict:
@@ -3236,8 +3237,10 @@ async def login(body: LoginBody, response: Response):
         raise HTTPException(status_code=401, detail="Invalid email or password")
     if user.get("active") is False:
         raise HTTPException(status_code=403, detail="Account is disabled")
-    set_auth_cookies(response, user["id"], user["email"], user["role"])
-    return sanitize_contact_doc(clean(user), user)
+    access_token, refresh_token = set_auth_cookies(response, user["id"], user["email"], user["role"])
+    result = sanitize_contact_doc(clean(user), user)
+    result.update({"access_token": access_token, "refresh_token": refresh_token})
+    return result
 
 
 @api.post("/auth/logout")
@@ -3266,8 +3269,10 @@ async def refresh(request: Request, response: Response):
     user = await db.users.find_one({"id": payload["sub"]}, {"password_hash": 0})
     if not user:
         raise HTTPException(status_code=401, detail="User not found")
-    set_auth_cookies(response, user["id"], user["email"], user["role"])
-    return sanitize_contact_doc(clean(user), user)
+    access_token, refresh_token = set_auth_cookies(response, user["id"], user["email"], user["role"])
+    result = sanitize_contact_doc(clean(user), user)
+    result.update({"access_token": access_token, "refresh_token": refresh_token})
+    return result
 
 
 # ---------------------------------------------------------------------------
