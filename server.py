@@ -4140,11 +4140,15 @@ GOOGLE_OAUTH_TOKEN_URL = "https://oauth2.googleapis.com/token"
 def google_calendar_oauth_config() -> tuple[str, str, str, str]:
     client_id = os.environ.get("GOOGLE_CLIENT_ID", "").strip()
     client_secret = os.environ.get("GOOGLE_CLIENT_SECRET", "").strip()
-    backend_url = os.environ.get("BACKEND_PUBLIC_URL", "").rstrip("/")
-    frontend_url = os.environ.get("FRONTEND_PUBLIC_URL", "").strip().rstrip("/")
+    backend_url = os.environ.get("BACKEND_PUBLIC_URL", "https://taskko-crm-server.vercel.app").rstrip("/")
+    frontend_url = os.environ.get("FRONTEND_PUBLIC_URL", "https://app.propzel.tech").strip().rstrip("/")
     redirect_uri = f"{backend_url}/api/integrations/google-calendar/callback"
-    if not client_id or not client_secret or not backend_url or not frontend_url:
-        raise HTTPException(status_code=503, detail="Google Calendar OAuth is not configured")
+    missing = [name for name, value in {
+        "GOOGLE_CLIENT_ID": client_id,
+        "GOOGLE_CLIENT_SECRET": client_secret,
+    }.items() if not value]
+    if missing:
+        raise HTTPException(status_code=503, detail=f"Google Calendar OAuth is missing: {', '.join(missing)}")
     return client_id, client_secret, redirect_uri, frontend_url
 
 
@@ -4170,7 +4174,7 @@ def calendar_return_url(request: Request) -> str:
 @api.get("/integrations/google-calendar/status")
 async def google_calendar_status(user: dict = Depends(get_current_user)):
     connection = await db.google_calendar_connections.find_one({"user_id": user["id"], "organization_id": organization_scope(user).get("organization_id")}, {"_id": 0, "refresh_token_encrypted": 0})
-    return {"connected": bool(connection), "configured": bool(os.environ.get("GOOGLE_CLIENT_ID") and os.environ.get("GOOGLE_CLIENT_SECRET") and os.environ.get("BACKEND_PUBLIC_URL") and os.environ.get("FRONTEND_PUBLIC_URL"))}
+    return {"connected": bool(connection), "configured": bool(os.environ.get("GOOGLE_CLIENT_ID") and os.environ.get("GOOGLE_CLIENT_SECRET"))}
 
 
 @api.get("/integrations/google-calendar/connect")
