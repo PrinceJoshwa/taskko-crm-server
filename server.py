@@ -3983,7 +3983,7 @@ async def ingest_google_sheet_lead(
 
     existing = await db.leads.find_one(
         {"organization_id": organization_id, "google_sheets_row_key": body.row_key},
-        {"_id": 0, "id": 1},
+        {"_id": 0, "id": 1, "name": 1},
     )
     if existing:
         # Earlier versions of the sheet script could create a traceable fallback

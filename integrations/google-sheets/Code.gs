@@ -27,6 +27,7 @@ function onOpen() {
   SpreadsheetApp.getUi()
     .createMenu("Propzel")
     .addItem("Sync unsynced leads", "syncPropzelLeads")
+    .addItem("Repair imported lead names", "repairPropzelLeadNames")
     .addItem("Install hourly sync", "installHourlySync")
     .addToUi();
 }
@@ -39,6 +40,14 @@ function installHourlySync() {
 }
 
 function syncPropzelLeads() {
+  syncPropzelLeadsInternal(false);
+}
+
+function repairPropzelLeadNames() {
+  syncPropzelLeadsInternal(true);
+}
+
+function syncPropzelLeadsInternal(repairSyncedLeads) {
   const config = PropertiesService.getScriptProperties().getProperties();
   [PROPZEL_PROPERTIES.apiUrl, PROPZEL_PROPERTIES.organizationId, PROPZEL_PROPERTIES.syncSecret].forEach((key) => {
     if (!config[key] || config[key].indexOf("REPLACE_WITH") === 0) {
@@ -63,11 +72,11 @@ function syncPropzelLeads() {
   const updatedValues = sheet.getDataRange().getDisplayValues();
   const updatedHeaders = updatedValues[headerRowIndex].map(normalizeHeader);
 
-  for (let rowIndex = headerRowIndex + 1; rowIndex < updatedValues.length; rowIndex += 1) {
+  for (let rowIndex = 0; rowIndex < updatedValues.length; rowIndex += 1) {
     const row = updatedValues[rowIndex];
-    if (!row.some((cell) => String(cell).trim())) continue;
+    if (!row.some((cell) => String(cell).trim()) || isSourceHeaderRow(row)) continue;
     const currentStatus = row[statusColumn - 1];
-    if (currentStatus === "Synced") continue;
+    if (currentStatus === "Synced" && !repairSyncedLeads) continue;
 
     const lead = rowToLead(updatedHeaders, row);
     if (!lead.name) {
@@ -126,27 +135,37 @@ function rowToLead(headers, row) {
     budget_max: numberOrNull(value("budget max", "maximum budget")),
     configuration: value("configuration", "bhk") || null,
     location_pref: value("location", "location preference", "locality", "city") || null,
-    notes: value("notes", "message", "remarks", "comment") || null,
+    notes: value("notes", "message", "remarks", "comment", "feedback") || null,
   };
 }
 
 function findHeaderRow(values) {
-  const expectedHeaders = [
-    "name", "full name", "full_name", "customer name", "phone", "phone number", "phone_number",
-    "mobile", "email", "email address", "created time", "created_time", "leadgen id", "leadgen_id",
-  ].map(normalizeHeader);
   const scanLimit = Math.min(values.length, 20);
   let bestRow = -1;
   let bestScore = 0;
   for (let rowIndex = 0; rowIndex < scanLimit; rowIndex += 1) {
     const normalized = values[rowIndex].map(normalizeHeader);
-    const score = normalized.filter((value) => expectedHeaders.includes(value)).length;
+    const score = normalized.filter((value) => SOURCE_HEADER_NAMES.includes(value)).length;
     if (score > bestScore) {
       bestRow = rowIndex;
       bestScore = score;
     }
   }
   return bestScore > 0 ? bestRow : -1;
+}
+
+const SOURCE_HEADER_NAMES = [
+  "id", "name", "full name", "full_name", "customer name", "phone", "phone number", "phone_number",
+  "mobile", "email", "email address", "created time", "created_time", "leadgen id", "leadgen_id",
+  "platform", "feedback", "lead status", "lead_status", "form name", "form_name",
+].map(normalizeHeader);
+
+function isSourceHeaderRow(row) {
+  const headerCount = row
+    .map(normalizeHeader)
+    .filter((value) => SOURCE_HEADER_NAMES.includes(value))
+    .length;
+  return headerCount >= 3;
 }
 
 function ensureColumn(sheet, headers, title, headerRowNumber) {
