@@ -4580,12 +4580,13 @@ def _with_env_integration_defaults(settings: Optional[dict]) -> dict:
         # The current rollout uses one shared CallerDesk account. Its Vercel
         # credentials must override stale per-organisation values until each
         # organisation has its own confirmed CallerDesk account configuration.
-        # Evolution is deployed as a single server integration, just like the
-        # working WhatsApp reference.  Do not let an old organisation record
-        # silently replace the live API URL, API key, or shared instance.
+        # Evolution is one shared server integration, while each organisation
+        # may use its own paired instance on that server. Do not let a stale
+        # organisation record replace the live API URL or API key, but keep a
+        # confirmed organisation-specific instance name intact.
         if key in {
             "callerdesk_authcode", "callerdesk_virtual_number",
-            "evolution_api_url", "evolution_api_key", "evolution_instance_name",
+            "evolution_api_url", "evolution_api_key",
         } or not merged.get(key):
             merged[key] = value
     if defaults.get("evolution_api_url") and defaults.get("evolution_api_key"):
@@ -5024,15 +5025,23 @@ def _first_payload_value(payload, keys: list[str]) -> Optional[str]:
     return None
 
 
-async def _persist_whatsapp_instance(settings: dict, instance: dict) -> Optional[str]:
+async def _persist_whatsapp_instance(organization_id: Optional[str], settings: dict, instance: dict) -> Optional[str]:
+    """Persist a legacy-provider instance on the active organisation only."""
     instance_id = _first_payload_value(instance, ["instance_id", "instanceId", "token", "id"])
     if not instance_id:
         return None
     instance_id = str(instance_id)
     settings["whatsapp_instance_id"] = instance_id
+    if not organization_id:
+        return instance_id
     await db.settings.update_one(
-        {"id": "singleton"},
-        {"$set": {"whatsapp_instance_id": instance_id, "updated_at": now_utc().isoformat()}},
+        {"id": f"organization:{organization_id}"},
+        {"$set": {
+            "id": f"organization:{organization_id}",
+            "organization_id": organization_id,
+            "whatsapp_instance_id": instance_id,
+            "updated_at": now_utc().isoformat(),
+        }},
         upsert=True,
     )
     return instance_id
@@ -5044,10 +5053,8 @@ def _whatsapp_webhook_url() -> str:
         return configured.rstrip("/")
     if BACKEND_PUBLIC_URL.startswith("https://"):
         return f"{BACKEND_PUBLIC_URL.rstrip('/')}/api/whatsapp/webhook"
-    # Vercel may not expose BACKEND_PUBLIC_URL in every environment, but this
-    # is the stable production alias registered with the WhatsApp provider.
-    if os.environ.get("VERCEL"):
-        return "https://taskko-crm-server.vercel.app/api/whatsapp/webhook"
+    # Do not guess the deployment host. Evolution must receive the public
+    # backend configured for this environment, not a stale preview alias.
     return f"{BACKEND_PUBLIC_URL.rstrip('/')}/api/whatsapp/webhook" if BACKEND_PUBLIC_URL else ""
 
 
@@ -5147,6 +5154,34 @@ def _evolution_inbound_message(payload) -> Optional[dict]:
         "filename": media.get("fileName") or media.get("filename"),
         "mimetype": media.get("mimetype"),
     }
+
+
+def _evolution_message_status_update(payload) -> Optional[dict]:
+    """Extract a v2 MESSAGES_UPDATE acknowledgement without logging its body."""
+    if not isinstance(payload, dict):
+        return None
+    event_name = str(payload.get("event") or payload.get("type") or "").upper()
+    data = payload.get("data")
+    candidates = data if isinstance(data, list) else [data if isinstance(data, dict) else payload]
+    for candidate in candidates:
+        if not isinstance(candidate, dict):
+            continue
+        key = candidate.get("key") if isinstance(candidate.get("key"), dict) else {}
+        update = candidate.get("update") if isinstance(candidate.get("update"), dict) else {}
+        message_id = key.get("id") or candidate.get("messageId") or candidate.get("message_id")
+        raw_status = update.get("status") or candidate.get("status")
+        if not message_id or raw_status in (None, ""):
+            continue
+        normalized = str(raw_status).strip().lower()
+        status_map = {
+            "1": "pending", "2": "sent", "3": "delivered", "4": "read", "5": "played",
+            "pending": "pending", "server_ack": "sent", "sent": "sent",
+            "delivery_ack": "delivered", "delivered": "delivered",
+            "read": "read", "played": "played",
+        }
+        if "UPDATE" in event_name or update:
+            return {"message_id": str(message_id), "status": status_map.get(normalized, normalized)}
+    return None
 
 
 def _extract_whatsapp_message_id(payload: dict) -> Optional[str]:
@@ -5473,6 +5508,7 @@ async def create_whatsapp_message_for_lead(lead: dict, body: WhatsAppSendBody, a
         "message_type": "text",
         "text": body.text,
         "template_id": body.template_id,
+        "provider_message_id": ((provider_result.get("key") or {}).get("id") if isinstance(provider_result, dict) else None),
         "provider_status": provider_result.get("status"),
         "provider_response": provider_result,
         "created_at": now,
@@ -5562,8 +5598,13 @@ async def whatsapp_connect(actor: dict = Depends(require_roles("admin", "manager
         if state.get("status") == "provider_error":
             raise HTTPException(status_code=502, detail=state.get("message") or "Could not prepare the WhatsApp connection")
         webhook_path = f"{organization_id}/{actor['id']}" if personal_executive_account else str(organization_id or "")
-        webhook_url = f"{_whatsapp_webhook_url().rstrip('/')}/{webhook_path}" if _whatsapp_webhook_url() and webhook_path else ""
-        webhook = await evolution_request("POST", f"/webhook/set/{instance}", settings, {"webhook": {"enabled": True, "url": webhook_url, "webhook_by_events": False, "webhook_base64": True, "events": ["MESSAGES_UPSERT"]}}) if webhook_url else None
+        webhook_base = _whatsapp_webhook_url()
+        webhook_url = f"{webhook_base.rstrip('/')}/{webhook_path}" if webhook_base and webhook_path else ""
+        if not webhook_url:
+            raise HTTPException(status_code=500, detail="WhatsApp webhook URL is not configured. Set BACKEND_PUBLIC_URL or WHATSAPP_WEBHOOK_URL on the backend.")
+        webhook = await evolution_request("POST", f"/webhook/set/{instance}", settings, {"webhook": {"enabled": True, "url": webhook_url, "webhook_by_events": False, "webhook_base64": True, "events": ["MESSAGES_UPSERT", "MESSAGES_UPDATE"]}})
+        if webhook.get("status") in {"provider_error", "pending_credentials"}:
+            raise HTTPException(status_code=502, detail=webhook.get("message") or "Evolution API rejected the WhatsApp webhook")
         if personal_executive_account:
             await db.users.update_one({"id": actor["id"], **organization_scope(actor)}, {"$set": {"whatsapp_evolution_instance": instance}})
         return {"status": "ready", "instance_id": instance if actor.get("role") == "super_admin" else None, "connection_state": _evolution_connection_state(state), "provider": state, "webhook": webhook}
@@ -5583,7 +5624,7 @@ async def whatsapp_connect(actor: dict = Depends(require_roles("admin", "manager
         create_settings = dict(settings)
         create_settings.pop("whatsapp_instance_id", None)
         instance = await whatsapp_service_request("create_instance", create_settings)
-        await _persist_whatsapp_instance(settings, instance)
+        await _persist_whatsapp_instance(organization_id, settings, instance)
     webhook = None
     webhook_url = _whatsapp_webhook_url()
     if webhook_url:
@@ -5649,7 +5690,7 @@ async def whatsapp_qrcode(actor: dict = Depends(require_roles("admin", "manager"
         create_settings = dict(settings)
         create_settings.pop("whatsapp_instance_id", None)
         fresh_instance = await whatsapp_service_request("create_instance", create_settings)
-        if await _persist_whatsapp_instance(settings, fresh_instance):
+        if await _persist_whatsapp_instance(organization_scope(actor).get("organization_id"), settings, fresh_instance):
             webhook_url = _whatsapp_webhook_url()
             if webhook_url:
                 await whatsapp_service_request(
@@ -5950,6 +5991,16 @@ async def whatsapp_webhook(request: Request, organization_id: Optional[str] = No
         payload = await request.json()
     else:
         payload = dict(await request.form())
+    status_update = _evolution_message_status_update(payload)
+    if status_update:
+        result = await db.whatsapp_messages.update_one(
+            {
+                "organization_id": organization_id,
+                "provider_message_id": status_update["message_id"],
+            },
+            {"$set": {"provider_status": status_update["status"]}},
+        )
+        return {"ok": True, "status_updated": bool(result.matched_count)}
     evolution_message = _evolution_inbound_message(payload)
     payload = _coerce_whatsapp_payload(payload)
 
