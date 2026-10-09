@@ -4055,8 +4055,14 @@ async def ingest_google_sheet_lead(
     return {"ok": True, "created": True, "lead_id": lead["id"], "project_matched": bool(project_id)}
 
 
-async def _ingest_lead_from_payload(source: str, payload: dict) -> dict:
+async def _ingest_lead_from_payload(source: str, payload: dict, organization_id: str) -> dict:
     """Normalize an incoming external lead payload into a lead document."""
+    organization = await db.organizations.find_one(
+        {"id": organization_id, "active": {"$ne": False}}, {"_id": 0, "id": 1},
+    )
+    if not organization:
+        raise HTTPException(status_code=404, detail="Organisation not found")
+
     name = payload.get("name") or payload.get("full_name") or payload.get("customer_name") or "Unknown"
     phone = payload.get("phone") or payload.get("mobile") or payload.get("contact")
     email = payload.get("email") or payload.get("customer_email")
@@ -4064,9 +4070,16 @@ async def _ingest_lead_from_payload(source: str, payload: dict) -> dict:
     project_name = payload.get("project") or payload.get("project_name")
     project = None
     if project_name:
-        project = await db.projects.find_one({"name": {"$regex": f"^{project_name}$", "$options": "i"}}, {"id": 1})
+        project = await db.projects.find_one(
+            {
+                "organization_id": organization_id,
+                "name": {"$regex": f"^{re.escape(project_name)}$", "$options": "i"},
+            },
+            {"id": 1},
+        )
     lead = {
         "id": new_id(),
+        "organization_id": organization_id,
         "name": name,
         "phone": phone,
         "email": email,
@@ -4086,9 +4099,9 @@ async def _ingest_lead_from_payload(source: str, payload: dict) -> dict:
         "updated_at": now_utc().isoformat(),
     }
     # auto-assign
-    settings = await db.settings.find_one({"id": "singleton"}) or {}
+    settings = await db.settings.find_one({"id": f"organization:{organization_id}"}) or {}
     if settings.get("auto_assign_enabled", True):
-        lead["assigned_to"] = await _pick_auto_assignee()
+        lead["assigned_to"] = await _pick_auto_assignee(organization_id)
     await db.leads.insert_one(lead)
     lead.pop("_id", None)
     await log_activity(lead["id"], None, "lead_created", f"Auto-captured from {source}", {"raw": payload})
@@ -4101,7 +4114,7 @@ async def _ingest_lead_from_payload(source: str, payload: dict) -> dict:
             link=f"/leads/{lead['id']}",
             meta={"lead_id": lead["id"]},
         )
-    settings = await db.settings.find_one({"id": "singleton"}) or {}
+    settings = await db.settings.find_one({"id": f"organization:{organization_id}"}) or {}
     if settings.get("auto_call_on_new_lead") and lead.get("assigned_to") and lead.get("phone"):
         assignee = await db.users.find_one({"id": lead["assigned_to"]})
         if assignee and assignee.get("phone"):
@@ -4113,7 +4126,7 @@ async def _ingest_lead_from_payload(source: str, payload: dict) -> dict:
 
 
 @api.post("/webhooks/leads/{source}")
-async def webhook_leads(source: str, payload: dict):
+async def webhook_leads(source: str, payload: dict, organization_id: Optional[str] = Query(None)):
     """Public endpoint. External platforms POST here to push leads.
 
     Accepts sources: magicbricks, 99acres, commonfloor, housing, website,
@@ -4122,13 +4135,21 @@ async def webhook_leads(source: str, payload: dict):
     allowed = {"magicbricks", "99acres", "commonfloor", "housing", "website", "jagathi_website", "google_ads", "facebook", "instagram", "google_sheets", "referral", "walk_in"}
     if source not in allowed:
         raise HTTPException(status_code=400, detail=f"Unknown source '{source}'")
-    lead = await _ingest_lead_from_payload(source, payload)
+    target_organization_id = organization_id or payload.get("organization_id")
+    if not isinstance(target_organization_id, str) or not target_organization_id.strip():
+        raise HTTPException(status_code=400, detail="organization_id is required for external lead webhooks")
+    lead = await _ingest_lead_from_payload(source, payload, target_organization_id)
     return {"ok": True, "lead_id": lead["id"]}
 
 
 @api.post("/integrations/jagathi/channel-partner")
 async def jagathi_channel_partner_webhook(payload: dict):
-    lead = await _ingest_lead_from_payload("jagathi_website", payload)
+    organization = await db.organizations.find_one(
+        {"slug": "jagati", "active": {"$ne": False}}, {"_id": 0, "id": 1},
+    )
+    if not organization:
+        raise HTTPException(status_code=404, detail="Jagati organisation not found")
+    lead = await _ingest_lead_from_payload("jagathi_website", payload, organization["id"])
     await log_activity(lead["id"], None, "channel_partner_lead", "Captured from Jagathi channel partner form", {"raw": payload})
     return {"ok": True, "lead_id": lead["id"]}
 
